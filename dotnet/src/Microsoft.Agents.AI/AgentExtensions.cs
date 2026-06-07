@@ -1,7 +1,10 @@
 ﻿// Copyright (c) Microsoft. All rights reserved.
 
 using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.ComponentModel;
+using System.Linq;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
@@ -15,6 +18,9 @@ namespace Microsoft.Agents.AI;
 /// </summary>
 public static partial class AIAgentExtensions
 {
+    private static readonly ConcurrentDictionary<string, WeakReference<PendingAgentToolApprovals>> s_pendingAgentToolApprovalsByRequestId = [];
+    private static readonly AsyncLocal<List<ToolApprovalRequestContent>?> s_pendingAgentToolApprovalsForCurrentRun = new();
+
     /// <summary>
     /// Creates a new <see cref="AIAgentBuilder"/> using the specified agent as the foundation for the builder pipeline.
     /// </summary>
@@ -68,17 +74,56 @@ public static partial class AIAgentExtensions
     {
         Throw.IfNull(agent);
 
+        PendingAgentToolApprovals pendingApprovals = new();
+
         [Description("Invoke an agent to retrieve some information.")]
-        async Task<string> InvokeAgentAsync(
+        async Task<object?> InvokeAgentAsync(
             [Description("Input query to invoke the agent.")] string query,
             CancellationToken cancellationToken)
         {
+            FunctionInvocationContext? parentFunctionContext = FunctionInvokingChatClient.CurrentContext;
+            FunctionCallContent? parentToolCall = parentFunctionContext?.CallContent;
+            AgentSession? agentSession = session;
+            IEnumerable<ChatMessage> inputMessages;
+
+            if (parentToolCall is not null &&
+                pendingApprovals.Approvals.TryRemove(parentToolCall.CallId, out PendingAgentToolApproval? pendingApproval))
+            {
+                _ = s_pendingAgentToolApprovalsByRequestId.TryRemove(parentToolCall.CallId, out _);
+
+                agentSession = pendingApproval.Session;
+                inputMessages = pendingApproval.ApprovalRequests.ConvertAll(
+                    request => new ChatMessage(ChatRole.User, [request.CreateResponse(approved: true)]));
+            }
+            else
+            {
+                inputMessages = [new(ChatRole.User, query)];
+            }
+
             // Propagate any additional properties from the parent agent's run to the child agent if the parent is using a FunctionInvokingChatClient.
             AgentRunOptions? agentRunOptions = FunctionInvokingChatClient.CurrentContext?.Options?.AdditionalProperties is AdditionalPropertiesDictionary dict
                 ? new AgentRunOptions { AdditionalProperties = dict }
                 : null;
 
-            var response = await agent.RunAsync(query, session: session, options: agentRunOptions, cancellationToken: cancellationToken).ConfigureAwait(false);
+            var response = await agent.RunAsync(inputMessages, session: agentSession, options: agentRunOptions, cancellationToken: cancellationToken).ConfigureAwait(false);
+
+            List<ToolApprovalRequestContent> approvalRequests = response.Messages
+                .SelectMany(message => message.Contents)
+                .OfType<ToolApprovalRequestContent>()
+                .ToList();
+
+            if (approvalRequests.Count > 0 && parentToolCall is not null)
+            {
+                pendingApprovals.Approvals[parentToolCall.CallId] = new(agent, agentSession, parentToolCall, approvalRequests);
+                s_pendingAgentToolApprovalsByRequestId[parentToolCall.CallId] = new(pendingApprovals);
+
+                parentFunctionContext!.Terminate = true;
+
+                s_pendingAgentToolApprovalsForCurrentRun.Value?.Add(new ToolApprovalRequestContent(parentToolCall.CallId, parentToolCall));
+
+                return string.Empty;
+            }
+
             return response.Text;
         }
 
@@ -88,6 +133,182 @@ public static partial class AIAgentExtensions
 
         return AIFunctionFactory.Create(InvokeAgentAsync, options);
     }
+
+    internal static async Task<IReadOnlyCollection<ChatMessage>> ProcessAgentToolApprovalResponsesAsync(
+        IReadOnlyCollection<ChatMessage> messages,
+        CancellationToken cancellationToken)
+    {
+        List<ChatMessage>? processedMessages = null;
+        List<AIContent>? toolResults = null;
+
+        foreach (ChatMessage message in messages)
+        {
+            List<AIContent>? processedContents = null;
+
+            for (int i = 0; i < message.Contents.Count; i++)
+            {
+                AIContent content = message.Contents[i];
+                if (content is ToolApprovalResponseContent { Approved: true } response &&
+                    TryTakePendingAgentToolApproval(response.RequestId, out PendingAgentToolApproval? pendingApproval) &&
+                    pendingApproval is not null)
+                {
+                    processedMessages ??= [];
+                    processedContents ??= [.. message.Contents.Take(i)];
+
+                    IEnumerable<ChatMessage> approvalMessages = pendingApproval.ApprovalRequests.ConvertAll(
+                        request => new ChatMessage(ChatRole.User, [request.CreateResponse(approved: true)]));
+                    AgentResponse childResponse = await pendingApproval.Agent.RunAsync(
+                        approvalMessages,
+                        session: pendingApproval.Session,
+                        cancellationToken: cancellationToken).ConfigureAwait(false);
+
+                    (toolResults ??= []).Add(new FunctionResultContent(pendingApproval.ParentToolCall.CallId, childResponse.Text));
+                    continue;
+                }
+
+                processedContents?.Add(content);
+            }
+
+            if (processedMessages is not null)
+            {
+                if (processedContents is not null)
+                {
+                    if (processedContents.Count > 0)
+                    {
+                        ChatMessage processedMessage = message.Clone();
+                        processedMessage.Contents = processedContents;
+                        processedMessages.Add(processedMessage);
+                    }
+                }
+                else
+                {
+                    processedMessages.Add(message);
+                }
+            }
+        }
+
+        if (processedMessages is null)
+        {
+            return messages;
+        }
+
+        if (toolResults is { Count: > 0 })
+        {
+            processedMessages.Add(new ChatMessage(ChatRole.Tool, toolResults));
+        }
+
+        return processedMessages;
+    }
+
+    internal static IReadOnlyCollection<ChatMessage> RemoveConsumedAgentToolApprovalResponsesFromHistory(
+        IReadOnlyCollection<ChatMessage> messages)
+    {
+        List<ChatMessage>? processedMessages = null;
+
+        foreach (ChatMessage message in messages)
+        {
+            List<AIContent>? processedContents = null;
+
+            if (message.GetAgentRequestMessageSourceType() == AgentRequestMessageSourceType.ChatHistory)
+            {
+                for (int i = 0; i < message.Contents.Count; i++)
+                {
+                    AIContent content = message.Contents[i];
+                    if ((content is ToolApprovalResponseContent response &&
+                            !HasPendingAgentToolApproval(response.RequestId)) ||
+                        (content is ToolApprovalRequestContent request &&
+                            !HasPendingAgentToolApproval(request.RequestId)))
+                    {
+                        processedMessages ??= [];
+                        processedContents ??= [.. message.Contents.Take(i)];
+                        continue;
+                    }
+
+                    processedContents?.Add(content);
+                }
+            }
+
+            if (processedMessages is not null)
+            {
+                if (processedContents is not null)
+                {
+                    if (processedContents.Count > 0)
+                    {
+                        ChatMessage processedMessage = message.Clone();
+                        processedMessage.Contents = processedContents;
+                        processedMessages.Add(processedMessage);
+                    }
+                }
+                else
+                {
+                    processedMessages.Add(message);
+                }
+            }
+        }
+
+        return processedMessages ?? messages;
+    }
+
+    internal static bool EnsurePendingAgentToolApprovalsCollectorForCurrentRun()
+    {
+        if (s_pendingAgentToolApprovalsForCurrentRun.Value is not null)
+        {
+            return false;
+        }
+
+        s_pendingAgentToolApprovalsForCurrentRun.Value = [];
+        return true;
+    }
+
+    internal static List<ToolApprovalRequestContent>? TakePendingAgentToolApprovalsForCurrentRun()
+    {
+        List<ToolApprovalRequestContent>? approvalRequests = s_pendingAgentToolApprovalsForCurrentRun.Value;
+        s_pendingAgentToolApprovalsForCurrentRun.Value = null;
+        return approvalRequests;
+    }
+
+    internal static void ClearRejectedAgentToolApprovals(IEnumerable<ChatMessage> messages)
+    {
+        foreach (ToolApprovalResponseContent response in messages
+            .SelectMany(message => message.Contents)
+            .OfType<ToolApprovalResponseContent>())
+        {
+            if (!response.Approved)
+            {
+                _ = TryTakePendingAgentToolApproval(response.RequestId, out _);
+            }
+        }
+    }
+
+    private static bool TryTakePendingAgentToolApproval(string requestId, out PendingAgentToolApproval? pendingApproval)
+    {
+        pendingApproval = null;
+        if (!s_pendingAgentToolApprovalsByRequestId.TryRemove(requestId, out WeakReference<PendingAgentToolApprovals>? reference) ||
+            !reference.TryGetTarget(out PendingAgentToolApprovals? approvals))
+        {
+            return false;
+        }
+
+        return approvals.Approvals.TryRemove(requestId, out pendingApproval);
+    }
+
+    private static bool HasPendingAgentToolApproval(string requestId)
+    {
+        return s_pendingAgentToolApprovalsByRequestId.TryGetValue(requestId, out WeakReference<PendingAgentToolApprovals>? reference) &&
+            reference.TryGetTarget(out PendingAgentToolApprovals? approvals) &&
+            approvals.Approvals.ContainsKey(requestId);
+    }
+
+    private sealed class PendingAgentToolApprovals
+    {
+        public ConcurrentDictionary<string, PendingAgentToolApproval> Approvals { get; } = [];
+    }
+
+    private sealed record PendingAgentToolApproval(
+        AIAgent Agent,
+        AgentSession? Session,
+        FunctionCallContent ParentToolCall,
+        List<ToolApprovalRequestContent> ApprovalRequests);
 
     /// <summary>
     /// Removes characters from AI agent name that shouldn't be used in an AI function name.

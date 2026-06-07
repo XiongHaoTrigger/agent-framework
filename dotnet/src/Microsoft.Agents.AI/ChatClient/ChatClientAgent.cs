@@ -207,12 +207,16 @@ public sealed partial class ChatClientAgent : AIAgent
         CancellationToken cancellationToken = default)
     {
         var inputMessages = Throw.IfNull(messages) as IReadOnlyCollection<ChatMessage> ?? messages.ToList();
+        AIAgentExtensions.ClearRejectedAgentToolApprovals(inputMessages);
+        bool ownsPendingAgentToolApprovalsCollector = AIAgentExtensions.EnsurePendingAgentToolApprovalsCollectorForCurrentRun();
+        inputMessages = await AIAgentExtensions.ProcessAgentToolApprovalResponsesAsync(inputMessages, cancellationToken).ConfigureAwait(false);
 
         (ChatClientAgentSession safeSession,
          ChatOptions? chatOptions,
          List<ChatMessage> inputMessagesForChatClient,
          ChatClientAgentContinuationToken? _) =
             await this.PrepareSessionAndMessagesAsync(session, inputMessages, options, cancellationToken).ConfigureAwait(false);
+        inputMessagesForChatClient = [.. AIAgentExtensions.RemoveConsumedAgentToolApprovalResponsesFromHistory(inputMessagesForChatClient)];
 
         // Update the run context with the resolved session so any downstream classes
         // always have a valid session, even when the caller passed null.
@@ -232,8 +236,27 @@ public sealed partial class ChatClientAgent : AIAgent
         }
         catch (Exception ex)
         {
+            if (ownsPendingAgentToolApprovalsCollector)
+            {
+                _ = AIAgentExtensions.TakePendingAgentToolApprovalsForCurrentRun();
+            }
+
             await this.NotifyProvidersOfFailureAtEndOfRunAsync(safeSession, ex, inputMessagesForChatClient, chatOptions, cancellationToken).ConfigureAwait(false);
             throw;
+        }
+
+        if (ownsPendingAgentToolApprovalsCollector &&
+            AIAgentExtensions.TakePendingAgentToolApprovalsForCurrentRun() is { Count: > 0 } approvalRequests)
+        {
+            chatResponse = new ChatResponse([new ChatMessage(ChatRole.Assistant, approvalRequests.ConvertAll<AIContent>(request => request))])
+            {
+                ConversationId = chatResponse.ConversationId,
+                ResponseId = chatResponse.ResponseId,
+                CreatedAt = chatResponse.CreatedAt,
+                ModelId = chatResponse.ModelId,
+                FinishReason = chatResponse.FinishReason,
+                RawRepresentation = chatResponse.RawRepresentation,
+            };
         }
 
         this._logger.LogAgentChatClientInvokedAgent(nameof(RunAsync), this.Id, loggingAgentName, this._chatClientType, inputMessages.Count);
@@ -293,6 +316,7 @@ public sealed partial class ChatClientAgent : AIAgent
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         var inputMessages = Throw.IfNull(messages) as IReadOnlyCollection<ChatMessage> ?? messages.ToList();
+        AIAgentExtensions.ClearRejectedAgentToolApprovals(inputMessages);
 
         (ChatClientAgentSession safeSession,
          ChatOptions? chatOptions,

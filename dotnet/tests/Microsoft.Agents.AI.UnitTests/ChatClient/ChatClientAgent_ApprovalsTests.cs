@@ -303,4 +303,253 @@ public class ChatClientAgent_ApprovalsTests
     }
 
     #endregion
+
+    #region Agent-As-Tool Approval Tests
+
+    /// <summary>
+    /// Verifies that directly invoking an agent with an approval-required tool surfaces an approval request
+    /// and does not execute the protected tool before approval is granted.
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_ApprovalRequired_DirectAgentInvocation_DoesNotExecuteToolBeforeApprovalAsync()
+    {
+        // Arrange
+        int toolExecutionCount = 0;
+        var tool = AIFunctionFactory.Create(
+            () =>
+            {
+                toolExecutionCount++;
+                return "protected result";
+            },
+            "ProtectedTool",
+            "A protected tool");
+        var approvalTool = new ApprovalRequiredAIFunction(tool);
+
+        var serviceExpectations = new List<ChatClientAgentTestHelper.ServiceCallExpectation>
+        {
+            new(new ChatResponse([new(ChatRole.Assistant,
+                [new FunctionCallContent("call1", "ProtectedTool", new Dictionary<string, object?>())])])),
+        };
+
+        // Act
+        var result = await ChatClientAgentTestHelper.RunAsync(
+            inputMessages: [new(ChatRole.User, "Run the protected tool.")],
+            serviceCallExpectations: serviceExpectations,
+            agentOptions: new()
+            {
+                ChatOptions = new() { Tools = [approvalTool] },
+            });
+
+        // Assert
+        var approvalRequests = result.Response.Messages
+            .SelectMany(m => m.Contents)
+            .OfType<ToolApprovalRequestContent>()
+            .ToList();
+        Assert.Single(approvalRequests);
+        Assert.Equal(0, toolExecutionCount);
+    }
+
+    /// <summary>
+    /// Verifies that when an agent is registered as a tool for a triage agent, approval requests
+    /// produced by the child agent are surfaced to the caller and approval resumes the child agent.
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_ApprovalRequired_AgentAsTool_ApprovalResumesChildAgentAsync()
+    {
+        // Arrange
+        int protectedToolExecutionCount = 0;
+        var protectedTool = AIFunctionFactory.Create(
+            () =>
+            {
+                protectedToolExecutionCount++;
+                return "protected result";
+            },
+            "ProtectedTool",
+            "A protected tool");
+        var approvalTool = new ApprovalRequiredAIFunction(protectedTool);
+
+        var childCallIndex = new ChatClientAgentTestHelper.Ref<int>(0);
+        var childCapturedInputs = new List<List<ChatMessage>>();
+        var childServiceExpectations = new List<ChatClientAgentTestHelper.ServiceCallExpectation>
+        {
+            new(new ChatResponse([new(ChatRole.Assistant,
+                [new FunctionCallContent("child-call1", "ProtectedTool", new Dictionary<string, object?>())])])),
+            new(new ChatResponse([new(ChatRole.Assistant, "The protected operation is complete.")])),
+        };
+        var childMock = ChatClientAgentTestHelper.CreateSequentialMock(
+            childServiceExpectations,
+            childCallIndex,
+            childCapturedInputs);
+        var childAgent = new ChatClientAgent(
+            childMock.Object,
+            options: new()
+            {
+                ChatOptions = new() { Tools = [approvalTool] },
+                Name = "ChildAgent",
+                Description = "Handles protected operations.",
+            });
+        var childSession = await childAgent.CreateSessionAsync();
+        var childAgentTool = childAgent.AsAIFunction(session: childSession);
+
+        var parentCallIndex = new ChatClientAgentTestHelper.Ref<int>(0);
+        var parentCapturedInputs = new List<List<ChatMessage>>();
+        var parentServiceExpectations = new List<ChatClientAgentTestHelper.ServiceCallExpectation>
+        {
+            new(new ChatResponse([new(ChatRole.Assistant,
+                [new FunctionCallContent("parent-call1", childAgentTool.Name, new Dictionary<string, object?>
+                {
+                    ["query"] = "Run the protected operation.",
+                })])])),
+            new(new ChatResponse([new(ChatRole.Assistant, "The triage agent completed the protected operation.")])),
+        };
+        var parentMock = ChatClientAgentTestHelper.CreateSequentialMock(
+            parentServiceExpectations,
+            parentCallIndex,
+            parentCapturedInputs);
+        var parentAgent = new ChatClientAgent(
+            parentMock.Object,
+            options: new()
+            {
+                ChatOptions = new() { Tools = [childAgentTool] },
+                Name = "TriageAgent",
+                Description = "Routes work to specialized agents.",
+            });
+        var parentSession = await parentAgent.CreateSessionAsync();
+
+        // Act
+        var response1 = await parentAgent.RunAsync("Route this request to the child agent.", parentSession);
+
+        // Assert
+        var approvalRequests = response1.Messages
+            .SelectMany(m => m.Contents)
+            .OfType<ToolApprovalRequestContent>()
+            .ToList();
+        Assert.Single(approvalRequests);
+        Assert.Equal(childAgentTool.Name, ((FunctionCallContent)approvalRequests[0].ToolCall).Name);
+        Assert.Equal(0, protectedToolExecutionCount);
+        Assert.Equal(1, childCallIndex.Value);
+        Assert.Equal(1, parentCallIndex.Value);
+
+        // Act
+        var approvalMessages = approvalRequests.ConvertAll(request =>
+            new ChatMessage(ChatRole.User, [request.CreateResponse(approved: true)]));
+        var response2 = await parentAgent.RunAsync(approvalMessages, parentSession);
+
+        // Assert
+        Assert.Equal("The triage agent completed the protected operation.", response2.Text);
+        Assert.Equal(1, protectedToolExecutionCount);
+        Assert.Equal(2, childCallIndex.Value);
+        Assert.Equal(2, parentCallIndex.Value);
+    }
+
+    /// <summary>
+    /// Verifies that rejecting a parent approval request clears the pending child approval state.
+    /// </summary>
+    [Fact]
+    public async Task RunAsync_ApprovalRejected_AgentAsTool_ClearsPendingChildApprovalAsync()
+    {
+        // Arrange
+        int protectedToolExecutionCount = 0;
+        var protectedTool = AIFunctionFactory.Create(
+            () =>
+            {
+                protectedToolExecutionCount++;
+                return "protected result";
+            },
+            "ProtectedTool",
+            "A protected tool");
+        var approvalTool = new ApprovalRequiredAIFunction(protectedTool);
+
+        var childCallIndex = new ChatClientAgentTestHelper.Ref<int>(0);
+        var childCapturedInputs = new List<List<ChatMessage>>();
+        var childServiceExpectations = new List<ChatClientAgentTestHelper.ServiceCallExpectation>
+        {
+            new(new ChatResponse([new(ChatRole.Assistant,
+                [new FunctionCallContent("child-call1", "ProtectedTool", new Dictionary<string, object?>())])])),
+            new(new ChatResponse([new(ChatRole.Assistant,
+                [new FunctionCallContent("child-call2", "ProtectedTool", new Dictionary<string, object?>())])])),
+        };
+        var childMock = ChatClientAgentTestHelper.CreateSequentialMock(
+            childServiceExpectations,
+            childCallIndex,
+            childCapturedInputs);
+        var childAgent = new ChatClientAgent(
+            childMock.Object,
+            options: new()
+            {
+                ChatOptions = new() { Tools = [approvalTool] },
+                Name = "ChildAgent",
+                Description = "Handles protected operations.",
+            });
+        var childSession = await childAgent.CreateSessionAsync();
+        var childAgentTool = childAgent.AsAIFunction(session: childSession);
+
+        var parentCallIndex = new ChatClientAgentTestHelper.Ref<int>(0);
+        var parentCapturedInputs = new List<List<ChatMessage>>();
+        var parentServiceExpectations = new List<ChatClientAgentTestHelper.ServiceCallExpectation>
+        {
+            new(new ChatResponse([new(ChatRole.Assistant,
+                [new FunctionCallContent("parent-call1", childAgentTool.Name, new Dictionary<string, object?>
+                {
+                    ["query"] = "Run the protected operation.",
+                })])])),
+            new(new ChatResponse([new(ChatRole.Assistant, "The protected operation was rejected.")])),
+            new(new ChatResponse([new(ChatRole.Assistant,
+                [new FunctionCallContent("parent-call1", childAgentTool.Name, new Dictionary<string, object?>
+                {
+                    ["query"] = "Run the protected operation again.",
+                })])])),
+        };
+        var parentMock = ChatClientAgentTestHelper.CreateSequentialMock(
+            parentServiceExpectations,
+            parentCallIndex,
+            parentCapturedInputs);
+        var parentAgent = new ChatClientAgent(
+            parentMock.Object,
+            options: new()
+            {
+                ChatOptions = new() { Tools = [childAgentTool] },
+                Name = "TriageAgent",
+                Description = "Routes work to specialized agents.",
+            });
+        var parentSession = await parentAgent.CreateSessionAsync();
+
+        // Act
+        var response1 = await parentAgent.RunAsync("Route this request to the child agent.", parentSession);
+
+        // Assert
+        var approvalRequests1 = response1.Messages
+            .SelectMany(m => m.Contents)
+            .OfType<ToolApprovalRequestContent>()
+            .ToList();
+        Assert.Single(approvalRequests1);
+        Assert.Equal(0, protectedToolExecutionCount);
+
+        // Act
+        var rejectionMessages = approvalRequests1.ConvertAll(request =>
+            new ChatMessage(ChatRole.User, [request.CreateResponse(approved: false, reason: "User declined")]));
+        var response2 = await parentAgent.RunAsync(rejectionMessages, parentSession);
+
+        // Assert
+        Assert.Equal("The protected operation was rejected.", response2.Text);
+        Assert.Equal(0, protectedToolExecutionCount);
+        Assert.Equal(1, childCallIndex.Value);
+        Assert.Equal(2, parentCallIndex.Value);
+
+        // Act
+        var response3 = await parentAgent.RunAsync("Route this request to the child agent again.", parentSession);
+
+        // Assert
+        var approvalRequests3 = response3.Messages
+            .SelectMany(m => m.Contents)
+            .OfType<ToolApprovalRequestContent>()
+            .ToList();
+        Assert.Single(approvalRequests3);
+        Assert.Equal(childAgentTool.Name, ((FunctionCallContent)approvalRequests3[0].ToolCall).Name);
+        Assert.Equal(0, protectedToolExecutionCount);
+        Assert.Equal(2, childCallIndex.Value);
+        Assert.Equal(3, parentCallIndex.Value);
+    }
+
+    #endregion
 }
