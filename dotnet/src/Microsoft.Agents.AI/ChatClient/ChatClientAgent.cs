@@ -208,11 +208,19 @@ public sealed partial class ChatClientAgent : AIAgent
     {
         var inputMessages = Throw.IfNull(messages) as IReadOnlyCollection<ChatMessage> ?? messages.ToList();
 
+        // Agent-as-tool approvals are surfaced to the outer run as tool approvals. Process any
+        // approval responses before preparing the chat-client messages so approved child agents
+        // can resume and contribute the parent tool result.
+        bool ownsPendingAgentToolApprovalsCollector = AIAgentExtensions.EnsurePendingAgentToolApprovalsCollectorForCurrentRun();
+        inputMessages = await AIAgentExtensions.ProcessAgentToolApprovalResponsesAsync(inputMessages, cancellationToken).ConfigureAwait(false);
+
         (ChatClientAgentSession safeSession,
          ChatOptions? chatOptions,
          List<ChatMessage> inputMessagesForChatClient,
          ChatClientAgentContinuationToken? _) =
             await this.PrepareSessionAndMessagesAsync(session, inputMessages, options, cancellationToken).ConfigureAwait(false);
+
+        AIAgentExtensions.RemoveConsumedAgentToolApprovalResponsesFromHistory(inputMessagesForChatClient);
 
         // Update the run context with the resolved session so any downstream classes
         // always have a valid session, even when the caller passed null.
@@ -232,8 +240,31 @@ public sealed partial class ChatClientAgent : AIAgent
         }
         catch (Exception ex)
         {
+            if (ownsPendingAgentToolApprovalsCollector)
+            {
+                AIAgentExtensions.TakePendingAgentToolApprovalsForCurrentRun();
+            }
+
             await this.NotifyProvidersOfFailureAtEndOfRunAsync(safeSession, ex, inputMessagesForChatClient, chatOptions, cancellationToken).ConfigureAwait(false);
             throw;
+        }
+
+        if (ownsPendingAgentToolApprovalsCollector &&
+            AIAgentExtensions.TakePendingAgentToolApprovalsForCurrentRun() is { Count: > 0 } pendingAgentToolApprovals)
+        {
+            // The child agent stopped on approval, so the outer run should stop on the mapped
+            // parent tool approval instead of returning the intermediate tool result.
+            chatResponse = new ChatResponse([new ChatMessage(ChatRole.Assistant, [.. pendingAgentToolApprovals])])
+            {
+                AdditionalProperties = chatResponse.AdditionalProperties,
+                ConversationId = chatResponse.ConversationId,
+                CreatedAt = chatResponse.CreatedAt,
+                FinishReason = chatResponse.FinishReason,
+                ModelId = chatResponse.ModelId,
+                RawRepresentation = chatResponse.RawRepresentation,
+                ResponseId = chatResponse.ResponseId,
+                Usage = chatResponse.Usage,
+            };
         }
 
         this._logger.LogAgentChatClientInvokedAgent(nameof(RunAsync), this.Id, loggingAgentName, this._chatClientType, inputMessages.Count);
@@ -294,11 +325,19 @@ public sealed partial class ChatClientAgent : AIAgent
     {
         var inputMessages = Throw.IfNull(messages) as IReadOnlyCollection<ChatMessage> ?? messages.ToList();
 
+        // Agent-as-tool approvals are surfaced to the outer run as tool approvals. Process any
+        // approval responses before preparing the chat-client messages so approved child agents
+        // can resume and contribute the parent tool result.
+        bool ownsPendingAgentToolApprovalsCollector = AIAgentExtensions.EnsurePendingAgentToolApprovalsCollectorForCurrentRun();
+        inputMessages = await AIAgentExtensions.ProcessAgentToolApprovalResponsesAsync(inputMessages, cancellationToken).ConfigureAwait(false);
+
         (ChatClientAgentSession safeSession,
          ChatOptions? chatOptions,
          List<ChatMessage> inputMessagesForChatClient,
          ChatClientAgentContinuationToken? continuationToken) =
             await this.PrepareSessionAndMessagesAsync(session, inputMessages, options, cancellationToken).ConfigureAwait(false);
+
+        AIAgentExtensions.RemoveConsumedAgentToolApprovalResponsesFromHistory(inputMessagesForChatClient);
 
         // Update the run context with the resolved session so any downstream classes
         // always have a valid session, even when the caller passed null.
@@ -323,6 +362,11 @@ public sealed partial class ChatClientAgent : AIAgent
         }
         catch (Exception ex)
         {
+            if (ownsPendingAgentToolApprovalsCollector)
+            {
+                AIAgentExtensions.TakePendingAgentToolApprovalsForCurrentRun();
+            }
+
             await this.NotifyProvidersOfFailureAtEndOfRunAsync(safeSession, ex, GetInputMessages(inputMessagesForChatClient, continuationToken), chatOptions, cancellationToken).ConfigureAwait(false);
             throw;
         }
@@ -337,6 +381,7 @@ public sealed partial class ChatClientAgent : AIAgent
         // turn, leaving the next request to the model with dangling tool calls.
         try
         {
+            List<ChatResponseUpdate>? bufferedAgentToolUpdates = null;
             bool hasUpdates;
             try
             {
@@ -354,15 +399,80 @@ public sealed partial class ChatClientAgent : AIAgent
                 var update = responseUpdatesEnumerator.Current;
                 if (update is not null)
                 {
-                    update.AuthorName ??= this.Name;
-
-                    responseUpdates.Add(update);
-
-                    yield return new(update)
+                    if (ownsPendingAgentToolApprovalsCollector &&
+                        AIAgentExtensions.TryTakePendingAgentToolApprovalsForCurrentRun(out List<ToolApprovalRequestContent> pendingAgentToolApprovals))
                     {
-                        AgentId = this.Id,
-                        ContinuationToken = WrapContinuationToken(update.ContinuationToken, GetInputMessages(inputMessages, continuationToken), responseUpdates)
-                    };
+                        // The child agent stopped on approval, so the streaming outer run should
+                        // stop on the mapped parent tool approval instead of yielding the
+                        // intermediate tool update from the parent chat client.
+                        ChatResponseUpdate approvalUpdate = new(ChatRole.Assistant, [.. pendingAgentToolApprovals])
+                        {
+                            AdditionalProperties = update.AdditionalProperties,
+                            AuthorName = update.AuthorName,
+                            ContinuationToken = update.ContinuationToken,
+                            ConversationId = update.ConversationId,
+                            CreatedAt = update.CreatedAt,
+                            FinishReason = update.FinishReason,
+                            MessageId = update.MessageId,
+                            ModelId = update.ModelId,
+                            RawRepresentation = update.RawRepresentation,
+                            ResponseId = update.ResponseId,
+                        };
+
+                        approvalUpdate.AuthorName ??= this.Name;
+                        responseUpdates.Add(approvalUpdate);
+
+                        yield return new(approvalUpdate)
+                        {
+                            AgentId = this.Id,
+                            ContinuationToken = WrapContinuationToken(approvalUpdate.ContinuationToken, GetInputMessages(inputMessages, continuationToken), responseUpdates)
+                        };
+
+                        break;
+                    }
+
+                    bool containsAgentToolCall = AIAgentExtensions.RegisterStreamingAgentToolCalls(chatOptions, update);
+                    AIAgentExtensions.CompleteStreamingAgentToolCalls(update);
+
+                    if (ownsPendingAgentToolApprovalsCollector &&
+                        (containsAgentToolCall || bufferedAgentToolUpdates is not null))
+                    {
+                        bufferedAgentToolUpdates ??= [];
+                        bufferedAgentToolUpdates.Add(update);
+
+                        // Agent-as-tool streaming approvals are detected only after FunctionInvokingChatClient
+                        // advances far enough to invoke the wrapped child agent. Buffer those internal parent
+                        // tool updates until we know whether the child stopped on approval.
+                        if (!AIAgentExtensions.HasPendingStreamingAgentToolCallsForCurrentRun())
+                        {
+                            foreach (ChatResponseUpdate bufferedUpdate in bufferedAgentToolUpdates)
+                            {
+                                bufferedUpdate.AuthorName ??= this.Name;
+
+                                responseUpdates.Add(bufferedUpdate);
+
+                                yield return new(bufferedUpdate)
+                                {
+                                    AgentId = this.Id,
+                                    ContinuationToken = WrapContinuationToken(bufferedUpdate.ContinuationToken, GetInputMessages(inputMessages, continuationToken), responseUpdates)
+                                };
+                            }
+
+                            bufferedAgentToolUpdates = null;
+                        }
+                    }
+                    else
+                    {
+                        update.AuthorName ??= this.Name;
+
+                        responseUpdates.Add(update);
+
+                        yield return new(update)
+                        {
+                            AgentId = this.Id,
+                            ContinuationToken = WrapContinuationToken(update.ContinuationToken, GetInputMessages(inputMessages, continuationToken), responseUpdates)
+                        };
+                    }
                 }
 
                 try
@@ -380,6 +490,23 @@ public sealed partial class ChatClientAgent : AIAgent
                 }
             }
 
+            if (ownsPendingAgentToolApprovalsCollector &&
+                AIAgentExtensions.TryTakePendingAgentToolApprovalsForCurrentRun(out List<ToolApprovalRequestContent> remainingAgentToolApprovals))
+            {
+                ChatResponseUpdate approvalUpdate = new(ChatRole.Assistant, [.. remainingAgentToolApprovals])
+                {
+                    AuthorName = this.Name,
+                };
+
+                responseUpdates.Add(approvalUpdate);
+
+                yield return new(approvalUpdate)
+                {
+                    AgentId = this.Id,
+                    ContinuationToken = WrapContinuationToken(approvalUpdate.ContinuationToken, GetInputMessages(inputMessages, continuationToken), responseUpdates)
+                };
+            }
+
             var chatResponse = responseUpdates.ToChatResponse();
 
             var forceEndOfRunPersistence = continuationToken is not null || chatOptions?.AllowBackgroundResponses is true;
@@ -395,6 +522,13 @@ public sealed partial class ChatClientAgent : AIAgent
         }
         finally
         {
+            if (ownsPendingAgentToolApprovalsCollector)
+            {
+                AIAgentExtensions.TakePendingAgentToolApprovalsForCurrentRun();
+            }
+
+            AIAgentExtensions.ClearStreamingAgentToolCallsForCurrentRun();
+
             await responseUpdatesEnumerator.DisposeAsync().ConfigureAwait(false);
         }
     }
