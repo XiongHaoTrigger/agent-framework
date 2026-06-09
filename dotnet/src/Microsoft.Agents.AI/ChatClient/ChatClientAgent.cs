@@ -232,7 +232,7 @@ public sealed partial class ChatClientAgent : AIAgent
         }
         catch (Exception ex)
         {
-            await this.NotifyProvidersOfFailureAtEndOfRunAsync(safeSession, ex, inputMessagesForChatClient, chatOptions, cancellationToken).ConfigureAwait(false);
+            await this.NotifyProvidersOfFailureAtEndOfRunAsync(safeSession, ex, GetEffectiveRequestMessages(safeSession, inputMessagesForChatClient), chatOptions, cancellationToken).ConfigureAwait(false);
             throw;
         }
 
@@ -252,7 +252,7 @@ public sealed partial class ChatClientAgent : AIAgent
         // Notify providers of all new messages unless persistence is handled per-service-call by the decorator.
         // When background responses are allowed, force notification since per-service-call persistence
         // is unreliable (the caller may stop consuming the stream before the decorator can persist).
-        await this.NotifyProvidersOfNewMessagesAtEndOfRunAsync(safeSession, inputMessagesForChatClient, chatResponse.Messages, chatOptions, cancellationToken, forceNotify: forceEndOfRunPersistence).ConfigureAwait(false);
+        await this.NotifyProvidersOfNewMessagesAtEndOfRunAsync(safeSession, GetEffectiveRequestMessages(safeSession, inputMessagesForChatClient), chatResponse.Messages, chatOptions, cancellationToken, forceNotify: forceEndOfRunPersistence).ConfigureAwait(false);
 
         return new AgentResponse(chatResponse)
         {
@@ -323,7 +323,7 @@ public sealed partial class ChatClientAgent : AIAgent
         }
         catch (Exception ex)
         {
-            await this.NotifyProvidersOfFailureAtEndOfRunAsync(safeSession, ex, GetInputMessages(inputMessagesForChatClient, continuationToken), chatOptions, cancellationToken).ConfigureAwait(false);
+            await this.NotifyProvidersOfFailureAtEndOfRunAsync(safeSession, ex, GetInputMessages(GetEffectiveRequestMessages(safeSession, inputMessagesForChatClient), continuationToken), chatOptions, cancellationToken).ConfigureAwait(false);
             throw;
         }
 
@@ -345,7 +345,7 @@ public sealed partial class ChatClientAgent : AIAgent
             }
             catch (Exception ex)
             {
-                await this.NotifyProvidersOfFailureAtEndOfRunAsync(safeSession, ex, GetInputMessages(inputMessagesForChatClient, continuationToken), chatOptions, cancellationToken).ConfigureAwait(false);
+                await this.NotifyProvidersOfFailureAtEndOfRunAsync(safeSession, ex, GetInputMessages(GetEffectiveRequestMessages(safeSession, inputMessagesForChatClient), continuationToken), chatOptions, cancellationToken).ConfigureAwait(false);
                 throw;
             }
 
@@ -375,7 +375,7 @@ public sealed partial class ChatClientAgent : AIAgent
                 }
                 catch (Exception ex)
                 {
-                    await this.NotifyProvidersOfFailureAtEndOfRunAsync(safeSession, ex, GetInputMessages(inputMessagesForChatClient, continuationToken), chatOptions, cancellationToken).ConfigureAwait(false);
+                    await this.NotifyProvidersOfFailureAtEndOfRunAsync(safeSession, ex, GetInputMessages(GetEffectiveRequestMessages(safeSession, inputMessagesForChatClient), continuationToken), chatOptions, cancellationToken).ConfigureAwait(false);
                     throw;
                 }
             }
@@ -391,7 +391,7 @@ public sealed partial class ChatClientAgent : AIAgent
             // Notify providers of all new messages unless persistence is handled per-service-call by the decorator.
             // When resuming from a continuation token or using background responses, force notification
             // to send the combined data (per-service-call persistence is unreliable for these scenarios).
-            await this.NotifyProvidersOfNewMessagesAtEndOfRunAsync(safeSession, GetInputMessages(inputMessagesForChatClient, continuationToken), chatResponse.Messages, chatOptions, cancellationToken, forceNotify: forceEndOfRunPersistence).ConfigureAwait(false);
+            await this.NotifyProvidersOfNewMessagesAtEndOfRunAsync(safeSession, GetInputMessages(GetEffectiveRequestMessages(safeSession, inputMessagesForChatClient), continuationToken), chatResponse.Messages, chatOptions, cancellationToken, forceNotify: forceEndOfRunPersistence).ConfigureAwait(false);
         }
         finally
         {
@@ -945,7 +945,13 @@ public sealed partial class ChatClientAgent : AIAgent
         var context = CurrentRunContext;
         if (context is not null && context.Session != safeSession)
         {
-            CurrentRunContext = new(context.Agent, safeSession, context.RequestMessages, context.RunOptions);
+            var updatedContext = new AgentRunContext(context.Agent, safeSession, context.RequestMessages, context.RunOptions);
+            if (context.EffectiveRequestMessages is not null)
+            {
+                updatedContext.SetEffectiveRequestMessages(context.EffectiveRequestMessages);
+            }
+
+            CurrentRunContext = updatedContext;
         }
     }
 
@@ -1060,6 +1066,14 @@ public sealed partial class ChatClientAgent : AIAgent
 
         // Fallback to messages saved in the continuation token if available.
         return token?.InputMessages ?? [];
+    }
+
+    private static IReadOnlyCollection<ChatMessage> GetEffectiveRequestMessages(ChatClientAgentSession session, IReadOnlyCollection<ChatMessage> defaultMessages)
+    {
+        var context = CurrentRunContext;
+        return context?.Session == session && context.EffectiveRequestMessages is not null
+            ? context.EffectiveRequestMessages
+            : defaultMessages;
     }
 
     private static List<ChatResponseUpdate> GetResponseUpdates(ChatClientAgentContinuationToken? token)

@@ -163,7 +163,8 @@ internal sealed class AIContextProviderChatClient : DelegatingChatClient
         // Materialize the accumulated context back into messages and options.
         // Clone options to avoid mutating the caller's instance across calls.
         options = options?.Clone();
-        var enrichedMessages = aiContext.Messages ?? [];
+        var enrichedMessages = aiContext.Messages as IReadOnlyCollection<ChatMessage> ?? aiContext.Messages?.ToList() ?? [];
+        runContext.SetEffectiveRequestMessages(enrichedMessages);
 
         var tools = aiContext.Tools as IList<AITool> ?? aiContext.Tools?.ToList();
         if (options?.Tools is { Count: > 0 } || tools is { Count: > 0 })

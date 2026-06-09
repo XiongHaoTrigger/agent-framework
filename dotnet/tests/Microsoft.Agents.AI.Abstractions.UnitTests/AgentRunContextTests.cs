@@ -197,6 +197,46 @@ public sealed class AgentRunContextTests
         Assert.Empty(context.RequestMessages);
     }
 
+    /// <summary>
+    /// Verifies that effective request messages can be set after construction.
+    /// </summary>
+    [Fact]
+    public void SetEffectiveRequestMessages_ValidMessages_StoresMessages()
+    {
+        // Arrange
+        AIAgent agent = new TestAgent();
+        AgentSession session = new TestAgentSession();
+        IReadOnlyCollection<ChatMessage> messages = new List<ChatMessage>();
+        IReadOnlyCollection<ChatMessage> effectiveMessages = new List<ChatMessage>
+        {
+            new(ChatRole.System, "Context"),
+            new(ChatRole.User, "Hello")
+        };
+        AgentRunContext context = new(agent, session, messages, null);
+
+        // Act
+        context.SetEffectiveRequestMessages(effectiveMessages);
+
+        // Assert
+        Assert.Same(effectiveMessages, context.EffectiveRequestMessages);
+    }
+
+    /// <summary>
+    /// Verifies that passing null for effective request messages throws ArgumentNullException.
+    /// </summary>
+    [Fact]
+    public void SetEffectiveRequestMessages_NullMessages_ThrowsArgumentNullException()
+    {
+        // Arrange
+        AIAgent agent = new TestAgent();
+        AgentSession session = new TestAgentSession();
+        IReadOnlyCollection<ChatMessage> messages = new List<ChatMessage>();
+        AgentRunContext context = new(agent, session, messages, null);
+
+        // Act & Assert
+        Assert.Throws<ArgumentNullException>(() => context.SetEffectiveRequestMessages(null!));
+    }
+
     #endregion
 
     #region Test Helpers

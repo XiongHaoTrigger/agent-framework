@@ -28,6 +28,40 @@ public sealed class ExpectedException : Exception
     }
 }
 
+internal sealed class StaticResponseChatClient(string responseText) : IChatClient
+{
+    public void Dispose()
+    {
+    }
+
+    public Task<ChatResponse> GetResponseAsync(
+        IEnumerable<ChatMessage> messages,
+        ChatOptions? options = null,
+        CancellationToken cancellationToken = default)
+        => Task.FromResult(new ChatResponse(new ChatMessage(ChatRole.Assistant, responseText)));
+
+    public async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(
+        IEnumerable<ChatMessage> messages,
+        ChatOptions? options = null,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        await Task.Yield();
+        yield return new ChatResponseUpdate(ChatRole.Assistant, responseText);
+    }
+
+    public object? GetService(Type serviceType, object? serviceKey = null)
+        => null;
+}
+
+internal sealed class StaticMessageAIContextProvider(string contextText) : AIContextProvider
+{
+    protected override ValueTask<AIContext> ProvideAIContextAsync(InvokingContext context, CancellationToken cancellationToken = default)
+        => new(new AIContext
+        {
+            Messages = [new ChatMessage(ChatRole.System, contextText)]
+        });
+}
+
 /// <summary>
 /// A simple agent that emits a FunctionCallContent or ToolApprovalRequestContent request.
 /// Used to test that RequestInfoEvent handling preserves the original content type.
@@ -216,6 +250,33 @@ public class NonChatProtocolExecutor() : Executor<string>(nameof(NonChatProtocol
 
 public class WorkflowHostSmokeTests : AIAgentHostingExecutorTestsBase
 {
+    [Fact]
+    public async Task Test_WorkflowHostAgent_SerializedSessionIncludesInnerAgentAIContextProviderMessagesAsync()
+    {
+        // Arrange
+        const string ContextMessageText = "context message from provider";
+        IChatClient chatClient = new ChatClientBuilder(new StaticResponseChatClient("done"))
+            .UseAIContextProviders(new StaticMessageAIContextProvider(ContextMessageText))
+            .Build();
+        ChatClientAgent innerAgent = new(
+            chatClient,
+            new ChatClientAgentOptions
+            {
+                UseProvidedChatClientAsIs = true
+            });
+        AIAgent workflowAgent = AgentWorkflowBuilder
+            .BuildSequential(innerAgent)
+            .AsAIAgent("WorkflowAgent");
+        AgentSession session = await workflowAgent.CreateSessionAsync();
+
+        // Act
+        await workflowAgent.RunAsync(new ChatMessage(ChatRole.User, "hello"), session);
+        JsonElement serializedSession = await workflowAgent.SerializeSessionAsync(session);
+
+        // Assert
+        serializedSession.ToString().Should().Contain(ContextMessageText);
+    }
+
     private sealed class AlwaysFailsAIAgent(bool failByThrowing) : AIAgent
     {
         private sealed class Session : AgentSession

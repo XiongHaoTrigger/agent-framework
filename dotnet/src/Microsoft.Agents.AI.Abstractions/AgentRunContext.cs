@@ -37,6 +37,16 @@ public sealed class AgentRunContext
     /// <summary>Gets the request messages passed into the current run.</summary>
     public IReadOnlyCollection<ChatMessage> RequestMessages { get; }
 
+    /// <summary>Gets the request messages used by downstream components after middleware transformations.</summary>
+    public IReadOnlyCollection<ChatMessage>? EffectiveRequestMessages { get; private set; }
+
     /// <summary>Gets the <see cref="AgentRunOptions"/> that was passed to the current run.</summary>
     public AgentRunOptions? RunOptions { get; }
+
+    /// <summary>Sets the request messages used by downstream components after middleware transformations.</summary>
+    /// <param name="requestMessages">The effective request messages used by downstream components.</param>
+    public void SetEffectiveRequestMessages(IReadOnlyCollection<ChatMessage> requestMessages)
+    {
+        this.EffectiveRequestMessages = Throw.IfNull(requestMessages);
+    }
 }
