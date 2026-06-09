@@ -331,14 +331,22 @@ public abstract partial class AIAgent
     /// System-role messages must be developer-controlled and should never contain end-user input.
     /// </para>
     /// </remarks>
-    public Task<AgentResponse> RunAsync(
+    public async Task<AgentResponse> RunAsync(
         IEnumerable<ChatMessage> messages,
         AgentSession? session = null,
         AgentRunOptions? options = null,
         CancellationToken cancellationToken = default)
     {
-        CurrentRunContext = new(this, session, messages as IReadOnlyCollection<ChatMessage> ?? messages.ToList(), options);
-        return this.RunCoreAsync(messages, session, options, cancellationToken);
+        var previousContext = CurrentRunContext;
+        try
+        {
+            CurrentRunContext = new(this, session, messages as IReadOnlyCollection<ChatMessage> ?? messages.ToList(), options);
+            return await this.RunCoreAsync(messages, session, options, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            CurrentRunContext = previousContext;
+        }
     }
 
     /// <summary>
@@ -467,14 +475,22 @@ public abstract partial class AIAgent
         AgentRunOptions? options = null,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
-        AgentRunContext context = new(this, session, messages as IReadOnlyCollection<ChatMessage> ?? messages.ToList(), options);
-        CurrentRunContext = context;
-        await foreach (var update in this.RunCoreStreamingAsync(messages, session, options, cancellationToken).ConfigureAwait(false))
+        var previousContext = CurrentRunContext;
+        try
         {
-            yield return update;
-
-            // Restore context again when resuming after the caller code executes.
+            AgentRunContext context = new(this, session, messages as IReadOnlyCollection<ChatMessage> ?? messages.ToList(), options);
             CurrentRunContext = context;
+            await foreach (var update in this.RunCoreStreamingAsync(messages, session, options, cancellationToken).ConfigureAwait(false))
+            {
+                yield return update;
+
+                // Restore context again when resuming after the caller code executes.
+                CurrentRunContext = context;
+            }
+        }
+        finally
+        {
+            CurrentRunContext = previousContext;
         }
     }
 

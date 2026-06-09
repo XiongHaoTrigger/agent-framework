@@ -3,6 +3,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq;
 using Microsoft.Agents.AI;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.DependencyInjection;
@@ -64,6 +65,16 @@ public static class ChatClientExtensions
             chatBuilder.Use(innerClient => new NonApprovalRequiredFunctionBypassingChatClient(innerClient));
         }
 
+        if (ContainsAgentAsFunctionTool(options))
+        {
+            // AgentAsFunctionApprovalDelegatingChatClient is registered after NonApprovalRequiredFunctionBypassingChatClient
+            // and before FunctionInvokingChatClient so that it sits between them in the pipeline:
+            //   NonApprovalRequiredFunctionBypassingChatClient -> AgentAsFunctionApprovalDelegatingChatClient -> FunctionInvokingChatClient -> ...
+            // This allows the decorator to intercept FunctionResultContent from agent-as-function tools and
+            // surface child agent approval requests to the parent agent's HITL pipeline.
+            chatBuilder.Use(innerClient => new AgentAsFunctionApprovalDelegatingChatClient(innerClient));
+        }
+
         if (chatClient.GetService<FunctionInvokingChatClient>() is null)
         {
             chatBuilder.Use((innerClient, services) =>
@@ -106,4 +117,8 @@ public static class ChatClientExtensions
 
         return agentChatClient;
     }
+
+    private static bool ContainsAgentAsFunctionTool(ChatClientAgentOptions? options)
+        => options?.ChatOptions?.Tools?.Any(static tool =>
+            tool.AdditionalProperties?.ContainsKey(AIAgentExtensions.AgentAsFunctionToolPropertyKey) == true) == true;
 }

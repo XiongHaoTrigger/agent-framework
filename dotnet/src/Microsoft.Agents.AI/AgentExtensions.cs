@@ -1,7 +1,9 @@
 ﻿// Copyright (c) Microsoft. All rights reserved.
 
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
+using System.Linq;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
@@ -15,6 +17,8 @@ namespace Microsoft.Agents.AI;
 /// </summary>
 public static partial class AIAgentExtensions
 {
+    internal const string AgentAsFunctionToolPropertyKey = "__Microsoft_Agents_AI_AgentAsFunction";
+
     /// <summary>
     /// Creates a new <see cref="AIAgentBuilder"/> using the specified agent as the foundation for the builder pipeline.
     /// </summary>
@@ -78,13 +82,60 @@ public static partial class AIAgentExtensions
                 ? new AgentRunOptions { AdditionalProperties = dict }
                 : null;
 
-            var response = await agent.RunAsync(query, session: session, options: agentRunOptions, cancellationToken: cancellationToken).ConfigureAwait(false);
+            // Start with the query as the first message.
+            var messages = new List<ChatMessage> { new ChatMessage(ChatRole.User, query) };
+            AgentResponse response = await agent.RunAsync(messages, session: session, options: agentRunOptions, cancellationToken: cancellationToken).ConfigureAwait(false);
+
+            // Check if the response contains ToolApprovalRequestContent items.
+            var approvalRequests = response.Messages
+                .SelectMany(m => m.Contents)
+                .OfType<ToolApprovalRequestContent>()
+                .ToList();
+
+            if (approvalRequests.Count > 0)
+            {
+                // Store the pending approval state in the parent session so the parent agent's HITL pipeline can surface it.
+                AgentSession? parentSession = AIAgent.CurrentRunContext?.Session;
+                if (parentSession != null)
+                {
+                    string parentCallId = FunctionInvokingChatClient.CurrentContext?.CallContent?.CallId ?? string.Empty;
+
+                    var pendingApproval = new AgentAsFunctionPendingApproval
+                    {
+                        ChildAgent = agent,
+                        ChildSession = session,
+                        ChildMessages = messages,
+                        ApprovalRequests = approvalRequests,
+                        ParentToolCallId = parentCallId,
+                    };
+
+                    string pendingApprovalKey = AgentAsFunctionApprovalDelegatingChatClient.StorePendingApproval(parentSession, parentCallId, pendingApproval);
+
+                    if (FunctionInvokingChatClient.CurrentContext is { } invocationContext)
+                    {
+                        invocationContext.Terminate = true;
+                    }
+
+                    // Return a marker string that the parent's chat client pipeline can detect
+                    // and replace with actual ToolApprovalRequestContent items.
+                    return AgentAsFunctionApprovalDelegatingChatClient.PendingApprovalMarkerPrefix + pendingApprovalKey;
+                }
+
+                // No parent session available; return empty string for backward compatibility.
+                return string.Empty;
+            }
+
             return response.Text;
         }
 
         options ??= new();
         options.Name ??= SanitizeAgentName(agent.Name);
         options.Description ??= agent.Description;
+        var additionalProperties = options.AdditionalProperties is null
+            ? new Dictionary<string, object?>()
+            : new Dictionary<string, object?>(options.AdditionalProperties);
+        additionalProperties[AgentAsFunctionToolPropertyKey] = true;
+        options.AdditionalProperties = additionalProperties;
 
         return AIFunctionFactory.Create(InvokeAgentAsync, options);
     }
