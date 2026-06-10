@@ -130,6 +130,7 @@ public class AsAIFunction_ApprovalTests
 
         Assert.Equal("childRequest1", surfacedApproval.RequestId);
         Assert.Same(childToolCall, surfacedApproval.ToolCall);
+        AssertParentCallPrecedesApproval(result.Response, parentToolCall, surfacedApproval);
         Assert.Equal(1, childAgent.RunAsyncCallCount);
         Assert.DoesNotContain(result.Response.Messages.SelectMany(m => m.Contents), c =>
             c is FunctionResultContent frc &&
@@ -200,6 +201,208 @@ public class AsAIFunction_ApprovalTests
         // Assert
         Assert.Equal(2, childAgent.RunAsyncCallCount);
         Assert.Equal("Parent observed child completion.", secondRun.Response.Text);
+    }
+
+    [Fact]
+    public async Task AsAIFunction_AsParentTool_WithSequentialApprovalResponses_SurfacesNextApprovalBeforeParentContinuesAsync()
+    {
+        // Arrange
+        const string FinalChildText = "Child action completed after approvals.";
+        var firstChildToolCall = new FunctionCallContent("childCall1", "FirstDangerousChildTool");
+        var firstChildApprovalRequest = new ToolApprovalRequestContent("childRequest1", firstChildToolCall);
+        var secondChildToolCall = new FunctionCallContent("childCall2", "SecondDangerousChildTool");
+        var secondChildApprovalRequest = new ToolApprovalRequestContent("childRequest2", secondChildToolCall);
+        var childAgent = new ApprovalTestAgent(
+            new AgentResponse(new ChatMessage(ChatRole.Assistant, [firstChildApprovalRequest])),
+            new AgentResponse(new ChatMessage(ChatRole.Assistant, [secondChildApprovalRequest])),
+            new AgentResponse(new ChatMessage(ChatRole.Assistant, FinalChildText)));
+        var childAsTool = childAgent.AsAIFunction();
+
+        var parentToolCall = new FunctionCallContent(
+            "parentCall1",
+            childAsTool.Name,
+            new Dictionary<string, object?> { ["query"] = "Run the child task" });
+
+        var callIndex = new ChatClientAgentTestHelper.Ref<int>(0);
+        var capturedInputs = new List<List<ChatMessage>>();
+        var serviceCallExpectations = new List<ChatClientAgentTestHelper.ServiceCallExpectation>
+        {
+            new(new ChatResponse([new(ChatRole.Assistant, [parentToolCall])])),
+            new(new ChatResponse([new(ChatRole.Assistant, "Parent observed child completion.")]),
+                messages =>
+                {
+                    FunctionResultContent functionResult = messages
+                        .SelectMany(m => m.Contents)
+                        .OfType<FunctionResultContent>()
+                        .Single();
+
+                    Assert.Equal("parentCall1", functionResult.CallId);
+                    Assert.Equal(FinalChildText, functionResult.Result);
+                }),
+        };
+
+        var firstRun = await ChatClientAgentTestHelper.RunAsync(
+            inputMessages: [new(ChatRole.User, "Delegate to the child agent")],
+            serviceCallExpectations: serviceCallExpectations,
+            agentOptions: new()
+            {
+                ChatOptions = new() { Tools = [childAsTool] },
+            },
+            callIndex: callIndex,
+            capturedInputs: capturedInputs);
+
+        ToolApprovalRequestContent firstSurfacedApproval = firstRun.Response.Messages
+            .SelectMany(m => m.Contents)
+            .OfType<ToolApprovalRequestContent>()
+            .Single();
+
+        Assert.Equal("childRequest1", firstSurfacedApproval.RequestId);
+        Assert.Same(firstChildToolCall, firstSurfacedApproval.ToolCall);
+
+        // Act 1: Approving the first child approval should surface the second child approval
+        // without letting the parent model continue yet.
+        var secondRun = await ChatClientAgentTestHelper.RunAsync(
+            inputMessages: [new(ChatRole.User, [firstSurfacedApproval.CreateResponse(approved: true)])],
+            serviceCallExpectations: serviceCallExpectations,
+            existingSession: firstRun.Session,
+            existingAgent: firstRun.Agent,
+            existingMock: firstRun.MockService,
+            callIndex: callIndex,
+            capturedInputs: capturedInputs,
+            expectedServiceCallCount: 1);
+
+        ToolApprovalRequestContent secondSurfacedApproval = secondRun.Response.Messages
+            .SelectMany(m => m.Contents)
+            .OfType<ToolApprovalRequestContent>()
+            .Single();
+
+        Assert.Equal("childRequest2", secondSurfacedApproval.RequestId);
+        Assert.Same(secondChildToolCall, secondSurfacedApproval.ToolCall);
+        AssertParentCallPrecedesApproval(secondRun.Response, parentToolCall, secondSurfacedApproval);
+
+        // Act 2: Only after approving the second child approval can the child complete and
+        // return its final text as the parent tool result.
+        var thirdRun = await ChatClientAgentTestHelper.RunAsync(
+            inputMessages: [new(ChatRole.User, [secondSurfacedApproval.CreateResponse(approved: true)])],
+            serviceCallExpectations: serviceCallExpectations,
+            existingSession: firstRun.Session,
+            existingAgent: firstRun.Agent,
+            existingMock: firstRun.MockService,
+            callIndex: callIndex,
+            capturedInputs: capturedInputs,
+            expectedServiceCallCount: 2);
+
+        // Assert
+        Assert.Equal(3, childAgent.RunAsyncCallCount);
+        Assert.Equal("Parent observed child completion.", thirdRun.Response.Text);
+    }
+
+    [Fact]
+    public async Task AsAIFunction_ThreeLevelNestedAgents_WithApprovalResponse_ResumesFullChainAsync()
+    {
+        // Arrange
+        const string FinalGrandchildText = "Grandchild action completed.";
+        const string FinalChildText = "Child observed grandchild completion.";
+        const string FinalParentText = "Parent observed child completion.";
+
+        var grandchildToolCall = new FunctionCallContent("grandchildCall1", "DangerousGrandchildTool");
+        var grandchildApprovalRequest = new ToolApprovalRequestContent("grandchildRequest1", grandchildToolCall);
+        var grandchildAgent = new ApprovalTestAgent(
+            new AgentResponse(new ChatMessage(ChatRole.Assistant, [grandchildApprovalRequest])),
+            new AgentResponse(new ChatMessage(ChatRole.Assistant, FinalGrandchildText)));
+        AgentSession grandchildSession = await grandchildAgent.CreateSessionAsync();
+        var grandchildAsTool = grandchildAgent.AsAIFunction(session: grandchildSession);
+
+        var childToGrandchildCall = new FunctionCallContent(
+            "childToGrandchildCall1",
+            grandchildAsTool.Name,
+            new Dictionary<string, object?> { ["query"] = "Run the grandchild task" });
+
+        var childCallIndex = new ChatClientAgentTestHelper.Ref<int>(0);
+        var childCapturedInputs = new List<List<ChatMessage>>();
+        var childServiceExpectations = new List<ChatClientAgentTestHelper.ServiceCallExpectation>
+        {
+            new(new ChatResponse([new(ChatRole.Assistant, [childToGrandchildCall])])),
+            new(new ChatResponse([new(ChatRole.Assistant, FinalChildText)]),
+                messages =>
+                {
+                    FunctionResultContent functionResult = messages
+                        .SelectMany(m => m.Contents)
+                        .OfType<FunctionResultContent>()
+                        .Single();
+
+                    Assert.Equal("childToGrandchildCall1", functionResult.CallId);
+                    Assert.Equal(FinalGrandchildText, functionResult.Result);
+                }),
+        };
+        var childMock = ChatClientAgentTestHelper.CreateSequentialMock(childServiceExpectations, childCallIndex, childCapturedInputs);
+        var childAgent = new ChatClientAgent(
+            childMock.Object,
+            options: new ChatClientAgentOptions
+            {
+                ChatOptions = new() { Tools = [grandchildAsTool] },
+            },
+            services: new ServiceCollection().BuildServiceProvider());
+        var childSession = (ChatClientAgentSession)await childAgent.CreateSessionAsync();
+        var childAsTool = childAgent.AsAIFunction(session: childSession);
+
+        var parentToChildCall = new FunctionCallContent(
+            "parentToChildCall1",
+            childAsTool.Name,
+            new Dictionary<string, object?> { ["query"] = "Run the child task" });
+
+        var parentCallIndex = new ChatClientAgentTestHelper.Ref<int>(0);
+        var parentCapturedInputs = new List<List<ChatMessage>>();
+        var parentServiceExpectations = new List<ChatClientAgentTestHelper.ServiceCallExpectation>
+        {
+            new(new ChatResponse([new(ChatRole.Assistant, [parentToChildCall])])),
+            new(new ChatResponse([new(ChatRole.Assistant, FinalParentText)]),
+                messages =>
+                {
+                    FunctionResultContent functionResult = messages
+                        .SelectMany(m => m.Contents)
+                        .OfType<FunctionResultContent>()
+                        .Single();
+
+                    Assert.Equal("parentToChildCall1", functionResult.CallId);
+                    Assert.Equal(FinalChildText, functionResult.Result);
+                }),
+        };
+
+        var firstRun = await ChatClientAgentTestHelper.RunAsync(
+            inputMessages: [new(ChatRole.User, "Delegate through child and grandchild agents")],
+            serviceCallExpectations: parentServiceExpectations,
+            agentOptions: new()
+            {
+                ChatOptions = new() { Tools = [childAsTool] },
+            },
+            callIndex: parentCallIndex,
+            capturedInputs: parentCapturedInputs);
+
+        ToolApprovalRequestContent surfacedApproval = firstRun.Response.Messages
+            .SelectMany(m => m.Contents)
+            .OfType<ToolApprovalRequestContent>()
+            .Single();
+
+        Assert.Equal("grandchildRequest1", surfacedApproval.RequestId);
+        Assert.Same(grandchildToolCall, surfacedApproval.ToolCall);
+        AssertParentCallPrecedesApproval(firstRun.Response, parentToChildCall, surfacedApproval);
+
+        // Act
+        var secondRun = await ChatClientAgentTestHelper.RunAsync(
+            inputMessages: [new(ChatRole.User, [surfacedApproval.CreateResponse(approved: true)])],
+            serviceCallExpectations: parentServiceExpectations,
+            existingSession: firstRun.Session,
+            existingAgent: firstRun.Agent,
+            existingMock: firstRun.MockService,
+            callIndex: parentCallIndex,
+            capturedInputs: parentCapturedInputs,
+            expectedServiceCallCount: 2);
+
+        // Assert
+        Assert.Equal(2, grandchildAgent.RunAsyncCallCount);
+        Assert.Equal(2, childCallIndex.Value);
+        Assert.Equal(FinalParentText, secondRun.Response.Text);
     }
 
     [Fact]
@@ -296,6 +499,7 @@ public class AsAIFunction_ApprovalTests
 
         Assert.Equal("childRequest1", surfacedApproval.RequestId);
         Assert.Same(childToolCall, surfacedApproval.ToolCall);
+        AssertParentCallPrecedesApproval(result.Response, parentToolCall, surfacedApproval);
         Assert.Equal(1, childAgent.RunAsyncCallCount);
         Assert.DoesNotContain(result.Response.Messages.SelectMany(m => m.Contents), c =>
             c is FunctionResultContent frc &&
@@ -432,6 +636,20 @@ public class AsAIFunction_ApprovalTests
         {
             asyncLocal.Value = context;
         }
+    }
+
+    private static void AssertParentCallPrecedesApproval(
+        AgentResponse response,
+        FunctionCallContent parentToolCall,
+        ToolApprovalRequestContent surfacedApproval)
+    {
+        var contents = response.Messages.SelectMany(m => m.Contents).ToList();
+        int parentCallIndex = contents.FindIndex(c => ReferenceEquals(parentToolCall, c));
+        int approvalIndex = contents.FindIndex(c => ReferenceEquals(surfacedApproval, c));
+
+        Assert.True(parentCallIndex >= 0, "The surfaced transcript should retain the parent agent tool call.");
+        Assert.True(approvalIndex >= 0, "The surfaced transcript should contain the child approval request.");
+        Assert.True(parentCallIndex < approvalIndex, "The child approval request should follow the parent agent tool call.");
     }
 
     private static Mock<IChatClient> CreateSequentialStreamingMock(

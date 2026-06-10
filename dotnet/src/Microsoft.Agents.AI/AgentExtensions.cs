@@ -86,7 +86,9 @@ public static partial class AIAgentExtensions
             var messages = new List<ChatMessage> { new ChatMessage(ChatRole.User, query) };
             AgentResponse response = await agent.RunAsync(messages, session: session, options: agentRunOptions, cancellationToken: cancellationToken).ConfigureAwait(false);
 
-            // Check if the response contains ToolApprovalRequestContent items.
+            // A child agent can pause itself by returning approval requests. When
+            // this AIFunction is running as a parent tool, the parent tool call must
+            // pause as well until those child approvals are answered.
             var approvalRequests = response.Messages
                 .SelectMany(m => m.Contents)
                 .OfType<ToolApprovalRequestContent>()
@@ -94,12 +96,15 @@ public static partial class AIAgentExtensions
 
             if (approvalRequests.Count > 0)
             {
-                // Store the pending approval state in the parent session so the parent agent's HITL pipeline can surface it.
                 AgentSession? parentSession = AIAgent.CurrentRunContext?.Session;
                 if (parentSession != null)
                 {
                     string parentCallId = FunctionInvokingChatClient.CurrentContext?.CallContent?.CallId ?? string.Empty;
 
+                    // Keep the child agent state in this bridge instead of exposing
+                    // child approval plumbing as the parent tool result. The parent
+                    // call id lets the delegating chat client later turn the resumed
+                    // child response back into the result of the original parent tool call.
                     var pendingApproval = new AgentAsFunctionPendingApproval
                     {
                         ChildAgent = agent,
@@ -113,11 +118,16 @@ public static partial class AIAgentExtensions
 
                     if (FunctionInvokingChatClient.CurrentContext is { } invocationContext)
                     {
+                        // Stop the parent function invocation loop for this turn. The
+                        // delegating chat client will replace the marker result with
+                        // the child approval request before the response is returned.
                         invocationContext.Terminate = true;
                     }
 
-                    // Return a marker string that the parent's chat client pipeline can detect
-                    // and replace with actual ToolApprovalRequestContent items.
+                    // FunctionInvokingChatClient wraps this string as the parent
+                    // FunctionResultContent. It is intentionally an internal marker:
+                    // AgentAsFunctionApprovalDelegatingChatClient removes it and
+                    // surfaces the pending child approval request to the caller.
                     return AgentAsFunctionApprovalDelegatingChatClient.PendingApprovalMarkerPrefix + pendingApprovalKey;
                 }
 
@@ -131,9 +141,15 @@ public static partial class AIAgentExtensions
         options ??= new();
         options.Name ??= SanitizeAgentName(agent.Name);
         options.Description ??= agent.Description;
-        var additionalProperties = options.AdditionalProperties is null
-            ? new Dictionary<string, object?>()
-            : new Dictionary<string, object?>(options.AdditionalProperties);
+        var additionalProperties = new Dictionary<string, object?>();
+        if (options.AdditionalProperties is not null)
+        {
+            foreach (var property in options.AdditionalProperties)
+            {
+                additionalProperties[property.Key] = property.Value;
+            }
+        }
+
         additionalProperties[AgentAsFunctionToolPropertyKey] = true;
         options.AdditionalProperties = additionalProperties;
 

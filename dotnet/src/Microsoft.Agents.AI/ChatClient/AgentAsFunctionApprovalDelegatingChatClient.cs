@@ -63,8 +63,14 @@ internal sealed class AgentAsFunctionApprovalDelegatingChatClient : DelegatingCh
         var session = GetRequiredSession();
         var messagesList = messages.ToList();
 
+        // An approval response for a child tool is consumed before the parent model
+        // sees the request. If approved, it becomes a parent FunctionResultContent;
+        // if rejected, it becomes a rejection result for the same parent call.
         await this.ProcessIncomingApprovalResponsesAsync(messagesList, session, cancellationToken).ConfigureAwait(false);
 
+        // Processing an approval response can resume the child agent only far
+        // enough to produce another child approval request. Surface that request
+        // immediately instead of asking the parent model to continue.
         if (this.TrySurfacePendingApprovalsInMessages(messagesList, session))
         {
             return new ChatResponse(messagesList.Where(static m => m.Role == ChatRole.Assistant && m.Contents.Count > 0).ToList());
@@ -88,6 +94,9 @@ internal sealed class AgentAsFunctionApprovalDelegatingChatClient : DelegatingCh
 
         await this.ProcessIncomingApprovalResponsesAsync(messagesList, session, cancellationToken).ConfigureAwait(false);
 
+        // Approval responses can synchronously resume a child agent and add another
+        // marker result if the child asks for a follow-up approval. Surface that
+        // follow-up request without calling the parent model again.
         if (this.TrySurfacePendingApprovalsInMessages(messagesList, session))
         {
             foreach (var message in messagesList.Where(static m => m.Role == ChatRole.Assistant && m.Contents.Count > 0))
@@ -108,6 +117,9 @@ internal sealed class AgentAsFunctionApprovalDelegatingChatClient : DelegatingCh
             allUpdates.Add(update);
         }
 
+        // Streaming uses the same transcript rewrite as non-streaming. Buffering
+        // avoids yielding the internal marker FunctionResultContent before we know
+        // whether the child agent paused for approval.
         ChatResponse chatResponse = allUpdates.ToChatResponse();
         this.TrySurfacePendingApprovalsInMessages(chatResponse.Messages, session);
 
@@ -138,6 +150,15 @@ internal sealed class AgentAsFunctionApprovalDelegatingChatClient : DelegatingCh
                 $"{nameof(AgentAsFunctionApprovalDelegatingChatClient)} requires a session.");
     }
 
+    /// <summary>
+    /// Rewrites pending child-agent approval markers into caller-visible approval requests.
+    /// </summary>
+    /// <remarks>
+    /// The parent <see cref="FunctionInvokingChatClient"/> first records the child agent
+    /// as a normal parent tool call followed by an internal marker result. This method
+    /// removes only the marker result, keeps the parent tool call for transcript fidelity,
+    /// and inserts the child approval request after the parent call.
+    /// </remarks>
     private bool TrySurfacePendingApprovalsInMessages(IList<ChatMessage> messages, AgentSession session)
     {
         List<(string PendingKey, string ParentCallId, List<ToolApprovalRequestContent> ApprovalRequests)> toSurface = [];
@@ -168,6 +189,9 @@ internal sealed class AgentAsFunctionApprovalDelegatingChatClient : DelegatingCh
 
         foreach (var (pendingKey, parentCallId, approvalRequests) in toSurface)
         {
+            // The marker is transport-only state. Leaving it in the transcript would
+            // make the parent model see an artificial tool result instead of the
+            // approval pause.
             for (int i = messages.Count - 1; i >= 0; i--)
             {
                 var message = messages[i];
@@ -181,6 +205,10 @@ internal sealed class AgentAsFunctionApprovalDelegatingChatClient : DelegatingCh
                 }
             }
 
+            // Preserve the parent FunctionCallContent so callers can see that the
+            // parent agent invoked the child agent tool. The child approval remains
+            // the request to answer because its tool call id is what resumes the
+            // paused child agent.
             foreach (var message in messages)
             {
                 if (message.Role != ChatRole.Assistant)
@@ -192,17 +220,20 @@ internal sealed class AgentAsFunctionApprovalDelegatingChatClient : DelegatingCh
                 {
                     if (message.Contents[k] is FunctionCallContent fcc && fcc.CallId == parentCallId)
                     {
-                        message.Contents.RemoveAt(k);
+                        int insertIndex = k + 1;
                         foreach (var approvalRequest in approvalRequests)
                         {
-                            message.Contents.Insert(k, approvalRequest);
-                            k++;
+                            message.Contents.Insert(insertIndex, approvalRequest);
+                            insertIndex++;
                         }
                         break;
                     }
                 }
             }
 
+            // Approval responses arrive with the child tool call id. Map that id
+            // back to the stored pending state so approval/rejection can resume or
+            // clear the correct child invocation.
             foreach (var approvalRequest in approvalRequests)
             {
                 string? childCallId = approvalRequest.ToolCall?.CallId;
@@ -244,6 +275,9 @@ internal sealed class AgentAsFunctionApprovalDelegatingChatClient : DelegatingCh
                     continue;
                 }
 
+                // Only approval responses that match a child call id mapping belong
+                // to this bridge. Other approval responses are left for the regular
+                // approval pipeline.
                 string mappingKey = ChildCallIdMappingPrefix + (approvalResponse.ToolCall?.CallId ?? string.Empty);
                 if (!session.StateBag.TryGetValue<string>(mappingKey, out var pendingKey, AgentJsonUtilities.DefaultOptions) ||
                     pendingKey is null)
@@ -260,6 +294,9 @@ internal sealed class AgentAsFunctionApprovalDelegatingChatClient : DelegatingCh
 
                 if (approvalResponse.Approved)
                 {
+                    // Resume the child with the original child approval response.
+                    // Once the child completes, its text becomes the parent tool
+                    // result for the original agent-as-function call.
                     var resumeMessages = new List<ChatMessage>
                     {
                         new ChatMessage(ChatRole.User, [approvalResponse])
@@ -290,18 +327,16 @@ internal sealed class AgentAsFunctionApprovalDelegatingChatClient : DelegatingCh
                         pending.ApprovalRequests = moreApprovals;
                         pending.ChildMessages = resumeMessages;
                         s_pendingApprovals[pendingKey] = pending;
+                        session.StateBag.TryRemoveValue(mappingKey);
 
-                        foreach (var req in moreApprovals)
-                        {
-                            string? childCallId = req.ToolCall?.CallId;
-                            if (childCallId is not null)
-                            {
-                                session.StateBag.SetValue(
-                                    ChildCallIdMappingPrefix + childCallId,
-                                    pendingKey,
-                                    AgentJsonUtilities.DefaultOptions);
-                            }
-                        }
+                        // Re-enter the same marker rewrite path used by the initial
+                        // child approval. That lets the caller answer the next child
+                        // approval before the parent model observes any parent tool result.
+                        messages.Add(new ChatMessage(
+                            ChatRole.Tool,
+                            [new FunctionResultContent(
+                                pending.ParentToolCallId ?? string.Empty,
+                                PendingApprovalMarkerPrefix + pendingKey)]));
                     }
                     else
                     {
