@@ -1202,6 +1202,67 @@ public sealed class OpenAIResponsesIntegrationTests : IAsyncDisposable
     }
 
     /// <summary>
+    /// Verifies that tools and tool choice from a Responses request are forwarded to the underlying IChatClient.
+    /// </summary>
+    [Fact]
+    public async Task CreateResponse_WithToolsAndToolChoice_ForwardsChatOptionsToIChatClientAsync()
+    {
+        // Arrange
+        const string AgentName = "tool-options-agent";
+        const string Instructions = "You are a helpful assistant.";
+        const string ExpectedResponse = "Response";
+
+        this._httpClient = await this.CreateTestServerAsync(AgentName, Instructions, ExpectedResponse);
+        var mockChatClient = this.ResolveMockChatClient();
+        const string RequestJson = """
+            {
+              "model": "test-model",
+              "input": "What is the weather in Seattle?",
+              "stream": false,
+              "parallel_tool_calls": false,
+              "tools": [
+                {
+                  "type": "function",
+                  "name": "get_weather",
+                  "description": "Gets the weather for a location.",
+                  "parameters": {
+                    "type": "object",
+                    "properties": {
+                      "location": {
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "location"
+                    ]
+                  }
+                }
+              ],
+              "tool_choice": {
+                "type": "function",
+                "name": "get_weather"
+              }
+            }
+            """;
+
+        // Act
+        using StringContent content = new(RequestJson, Encoding.UTF8, "application/json");
+        HttpResponseMessage httpResponse = await this._httpClient.PostAsync(
+            new Uri($"/{AgentName}/v1/responses", UriKind.Relative),
+            content);
+
+        // Assert
+        Assert.True(httpResponse.IsSuccessStatusCode, $"Response status: {httpResponse.StatusCode}");
+        Assert.NotNull(mockChatClient.LastChatOptions);
+        Assert.False(mockChatClient.LastChatOptions.AllowMultipleToolCalls);
+        Assert.NotNull(mockChatClient.LastChatOptions.Tools);
+        AITool tool = Assert.Single(mockChatClient.LastChatOptions.Tools);
+        Assert.Equal("get_weather", tool.Name);
+        RequiredChatToolMode requiredToolMode = Assert.IsType<RequiredChatToolMode>(mockChatClient.LastChatOptions.ToolMode);
+        Assert.Equal("get_weather", requiredToolMode.RequiredFunctionName);
+    }
+
+    /// <summary>
     /// Verifies that conversation history is passed to the agent on subsequent requests.
     /// This test reproduces the bug described in GitHub issue #3484.
     /// </summary>
