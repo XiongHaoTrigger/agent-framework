@@ -3,6 +3,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -345,6 +346,152 @@ public class AIAgentTests
         {
             Assert.Single(capturedContext.RequestMessages);
         }
+    }
+
+    [Fact]
+    public async Task RunAsync_RestoresParentCurrentRunContextAfterNestedRunAsync()
+    {
+        // Arrange
+        var parentSession = new TestAgentSession();
+        var childSession = new TestAgentSession();
+        var parentOptions = new AgentRunOptions();
+        var childOptions = new AgentRunOptions();
+        AgentRunContext? parentContextBeforeChildRun = null;
+        AgentRunContext? childContextDuringRun = null;
+        AgentRunContext? parentContextAfterChildRun = null;
+        var initialContext = AIAgent.CurrentRunContext;
+
+        var childAgentMock = new Mock<AIAgent> { CallBase = true };
+        childAgentMock
+            .Protected()
+            .Setup<Task<AgentResponse>>("RunCoreAsync",
+                ItExpr.IsAny<IEnumerable<ChatMessage>>(),
+                ItExpr.IsAny<AgentSession?>(),
+                ItExpr.IsAny<AgentRunOptions?>(),
+                ItExpr.IsAny<CancellationToken>())
+            .Returns((IEnumerable<ChatMessage> _, AgentSession? _, AgentRunOptions? _, CancellationToken _) =>
+            {
+                childContextDuringRun = AIAgent.CurrentRunContext;
+                return Task.FromResult(new AgentResponse(new ChatMessage(ChatRole.Assistant, "Child response")));
+            });
+
+        var parentAgentMock = new Mock<AIAgent> { CallBase = true };
+        parentAgentMock
+            .Protected()
+            .Setup<Task<AgentResponse>>("RunCoreAsync",
+                ItExpr.IsAny<IEnumerable<ChatMessage>>(),
+                ItExpr.IsAny<AgentSession?>(),
+                ItExpr.IsAny<AgentRunOptions?>(),
+                ItExpr.IsAny<CancellationToken>())
+            .Returns(async (IEnumerable<ChatMessage> _, AgentSession? _, AgentRunOptions? _, CancellationToken cancellationToken) =>
+            {
+                parentContextBeforeChildRun = AIAgent.CurrentRunContext;
+
+                await childAgentMock.Object.RunAsync(
+                    [new ChatMessage(ChatRole.User, "Run child")],
+                    childSession,
+                    childOptions,
+                    cancellationToken);
+
+                parentContextAfterChildRun = AIAgent.CurrentRunContext;
+                return new AgentResponse(new ChatMessage(ChatRole.Assistant, "Parent response"));
+            });
+
+        // Act
+        await parentAgentMock.Object.RunAsync(
+            [new ChatMessage(ChatRole.User, "Run parent")],
+            parentSession,
+            parentOptions);
+
+        // Assert
+        Assert.NotNull(parentContextBeforeChildRun);
+        Assert.Same(parentAgentMock.Object, parentContextBeforeChildRun!.Agent);
+        Assert.Same(parentSession, parentContextBeforeChildRun.Session);
+        Assert.Same(parentOptions, parentContextBeforeChildRun.RunOptions);
+
+        Assert.NotNull(childContextDuringRun);
+        Assert.Same(childAgentMock.Object, childContextDuringRun!.Agent);
+        Assert.Same(childSession, childContextDuringRun.Session);
+        Assert.Same(childOptions, childContextDuringRun.RunOptions);
+
+        Assert.Same(parentContextBeforeChildRun, parentContextAfterChildRun);
+        Assert.Same(initialContext, AIAgent.CurrentRunContext);
+    }
+
+    [Fact]
+    public async Task RunStreamingAsync_RestoresParentCurrentRunContextAfterNestedRunAsync()
+    {
+        // Arrange
+        var parentSession = new TestAgentSession();
+        var childSession = new TestAgentSession();
+        var parentOptions = new AgentRunOptions();
+        var childOptions = new AgentRunOptions();
+        AgentRunContext? parentContextBeforeChildRun = null;
+        AgentRunContext? childContextDuringRun = null;
+        AgentRunContext? parentContextAfterChildRun = null;
+        var initialContext = AIAgent.CurrentRunContext;
+
+        var childAgentMock = new Mock<AIAgent> { CallBase = true };
+        childAgentMock
+            .Protected()
+            .Setup<IAsyncEnumerable<AgentResponseUpdate>>("RunCoreStreamingAsync",
+                ItExpr.IsAny<IEnumerable<ChatMessage>>(),
+                ItExpr.IsAny<AgentSession?>(),
+                ItExpr.IsAny<AgentRunOptions?>(),
+                ItExpr.IsAny<CancellationToken>())
+            .Returns((IEnumerable<ChatMessage> _, AgentSession? _, AgentRunOptions? _, CancellationToken _) =>
+            {
+                childContextDuringRun = AIAgent.CurrentRunContext;
+                return ToAsyncEnumerableAsync([new AgentResponseUpdate(ChatRole.Assistant, "Child response")]);
+            });
+
+        var parentAgentMock = new Mock<AIAgent> { CallBase = true };
+        parentAgentMock
+            .Protected()
+            .Setup<IAsyncEnumerable<AgentResponseUpdate>>("RunCoreStreamingAsync",
+                ItExpr.IsAny<IEnumerable<ChatMessage>>(),
+                ItExpr.IsAny<AgentSession?>(),
+                ItExpr.IsAny<AgentRunOptions?>(),
+                ItExpr.IsAny<CancellationToken>())
+            .Returns((IEnumerable<ChatMessage> _, AgentSession? _, AgentRunOptions? _, CancellationToken cancellationToken) => RunParentStreamingAsync(cancellationToken));
+
+        async IAsyncEnumerable<AgentResponseUpdate> RunParentStreamingAsync([EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            parentContextBeforeChildRun = AIAgent.CurrentRunContext;
+
+            await foreach (var _ in childAgentMock.Object.RunStreamingAsync(
+                [new ChatMessage(ChatRole.User, "Run child")],
+                childSession,
+                childOptions,
+                cancellationToken))
+            {
+            }
+
+            parentContextAfterChildRun = AIAgent.CurrentRunContext;
+            yield return new AgentResponseUpdate(ChatRole.Assistant, "Parent response");
+        }
+
+        // Act
+        await foreach (var _ in parentAgentMock.Object.RunStreamingAsync(
+            [new ChatMessage(ChatRole.User, "Run parent")],
+            parentSession,
+            parentOptions))
+        {
+        }
+
+        // Assert
+        Assert.NotNull(parentContextBeforeChildRun);
+        Assert.Same(parentAgentMock.Object, parentContextBeforeChildRun!.Agent);
+        Assert.Same(parentSession, parentContextBeforeChildRun.Session);
+        Assert.Same(parentOptions, parentContextBeforeChildRun.RunOptions);
+
+        Assert.NotNull(childContextDuringRun);
+        Assert.Same(childAgentMock.Object, childContextDuringRun!.Agent);
+        Assert.Same(childSession, childContextDuringRun.Session);
+        Assert.Same(childOptions, childContextDuringRun.RunOptions);
+
+        Assert.Same(parentContextBeforeChildRun, parentContextAfterChildRun);
+        Assert.Same(initialContext, AIAgent.CurrentRunContext);
     }
 
     [Fact]
