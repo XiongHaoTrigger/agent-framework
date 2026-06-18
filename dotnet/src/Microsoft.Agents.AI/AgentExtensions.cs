@@ -1,7 +1,9 @@
 ﻿// Copyright (c) Microsoft. All rights reserved.
 
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
+using System.Linq;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
@@ -15,6 +17,8 @@ namespace Microsoft.Agents.AI;
 /// </summary>
 public static partial class AIAgentExtensions
 {
+    internal const string AgentAsFunctionToolPropertyKey = "__Microsoft_Agents_AI_AgentAsFunction";
+
     /// <summary>
     /// Creates a new <see cref="AIAgentBuilder"/> using the specified agent as the foundation for the builder pipeline.
     /// </summary>
@@ -78,13 +82,59 @@ public static partial class AIAgentExtensions
                 ? new AgentRunOptions { AdditionalProperties = dict }
                 : null;
 
-            var response = await agent.RunAsync(query, session: session, options: agentRunOptions, cancellationToken: cancellationToken).ConfigureAwait(false);
+            var messages = new List<ChatMessage> { new(ChatRole.User, query) };
+            AgentResponse response = await agent.RunAsync(messages, session: session, options: agentRunOptions, cancellationToken: cancellationToken).ConfigureAwait(false);
+
+            var approvalRequests = response.Messages
+                .SelectMany(static m => m.Contents)
+                .OfType<ToolApprovalRequestContent>()
+                .ToList();
+
+            if (approvalRequests.Count > 0)
+            {
+                AgentSession? parentSession = AIAgent.CurrentRunContext?.Session;
+                if (parentSession is not null)
+                {
+                    string parentCallId = FunctionInvokingChatClient.CurrentContext?.CallContent?.CallId ?? string.Empty;
+                    var pendingApproval = new AgentAsFunctionPendingApproval(
+                        agent,
+                        session,
+                        approvalRequests,
+                        parentCallId);
+
+                    string pendingApprovalKey = AgentAsFunctionApprovalDelegatingChatClient.StorePendingApproval(
+                        parentSession,
+                        parentCallId,
+                        pendingApproval);
+
+                    if (FunctionInvokingChatClient.CurrentContext is { } invocationContext)
+                    {
+                        invocationContext.Terminate = true;
+                    }
+
+                    return AgentAsFunctionApprovalDelegatingChatClient.PendingApprovalMarkerPrefix + pendingApprovalKey;
+                }
+
+                return string.Empty;
+            }
+
             return response.Text;
         }
 
         options ??= new();
         options.Name ??= SanitizeAgentName(agent.Name);
         options.Description ??= agent.Description;
+        var additionalProperties = new Dictionary<string, object?>();
+        if (options.AdditionalProperties is not null)
+        {
+            foreach (var property in options.AdditionalProperties)
+            {
+                additionalProperties[property.Key] = property.Value;
+            }
+        }
+
+        additionalProperties[AgentAsFunctionToolPropertyKey] = true;
+        options.AdditionalProperties = additionalProperties;
 
         return AIFunctionFactory.Create(InvokeAgentAsync, options);
     }

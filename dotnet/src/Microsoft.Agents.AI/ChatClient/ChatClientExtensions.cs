@@ -3,6 +3,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq;
 using Microsoft.Agents.AI;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.DependencyInjection;
@@ -64,6 +65,11 @@ public static class ChatClientExtensions
             chatBuilder.Use(innerClient => new NonApprovalRequiredFunctionBypassingChatClient(innerClient));
         }
 
+        if (ContainsAgentAsFunctionTool(options))
+        {
+            chatBuilder.Use(innerClient => new AgentAsFunctionApprovalDelegatingChatClient(innerClient));
+        }
+
         if (chatClient.GetService<FunctionInvokingChatClient>() is null)
         {
             chatBuilder.Use((innerClient, services) =>
@@ -106,4 +112,8 @@ public static class ChatClientExtensions
 
         return agentChatClient;
     }
+
+    private static bool ContainsAgentAsFunctionTool(ChatClientAgentOptions? options)
+        => options?.ChatOptions?.Tools?.Any(static tool =>
+            tool.AdditionalProperties?.ContainsKey(AIAgentExtensions.AgentAsFunctionToolPropertyKey) == true) == true;
 }
