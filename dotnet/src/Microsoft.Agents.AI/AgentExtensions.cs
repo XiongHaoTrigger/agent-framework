@@ -1,10 +1,14 @@
 ﻿// Copyright (c) Microsoft. All rights reserved.
 
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
+using System.Linq;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Agents.AI.ChatClient;
 using Microsoft.Extensions.AI;
 using Microsoft.Shared.Diagnostics;
 
@@ -69,7 +73,7 @@ public static partial class AIAgentExtensions
         Throw.IfNull(agent);
 
         [Description("Invoke an agent to retrieve some information.")]
-        async Task<string> InvokeAgentAsync(
+        async Task<object> InvokeAgentAsync(
             [Description("Input query to invoke the agent.")] string query,
             CancellationToken cancellationToken)
         {
@@ -78,7 +82,68 @@ public static partial class AIAgentExtensions
                 ? new AgentRunOptions { AdditionalProperties = dict }
                 : null;
 
-            var response = await agent.RunAsync(query, session: session, options: agentRunOptions, cancellationToken: cancellationToken).ConfigureAwait(false);
+            // Save base agent data
+            var parentSession = AIAgent.CurrentRunContext?.Session;
+            var parentInvocationContext = FunctionInvokingChatClient.CurrentContext;
+
+            // Get sub agent session
+            var subSession = session ?? await agent.CreateSessionAsync(cancellationToken).ConfigureAwait(false);
+
+            // run sub agent
+            var response = await agent
+                .RunAsync(query, session: subSession, options: agentRunOptions, cancellationToken: cancellationToken)
+                .ConfigureAwait(false);
+
+            // Get tool approval requests
+            var toolApprovalRequests = response.Messages
+                .SelectMany(m => m.Contents)
+                .OfType<ToolApprovalRequestContent>().ToList();
+
+            // Need to handle tool approval requests if there are any approval requests
+            if (toolApprovalRequests.Count > 0)
+            {
+                if (parentSession is null)
+                {
+                    throw new InvalidOperationException("A parent session is required to resume the child agent.");
+                }
+
+                if (parentInvocationContext?.CallContent is not { } parentFunctionCall)
+                {
+                    throw new InvalidOperationException(
+                        "The parent function call context is unavailable.");
+                }
+
+                var serializedSession = await agent
+                    .SerializeSessionAsync(subSession, cancellationToken: cancellationToken).ConfigureAwait(false);
+
+                var continuation = new AgentFunctionContinuationState
+                {
+                    Id = Guid.NewGuid().ToString("N"),
+                    AgentAsFunctionName = parentFunctionCall.Name,
+                    ParentFunctionCall = parentFunctionCall,
+                    SubAgentSerializedSession = serializedSession,
+                    PendingToolApprovalRequests = toolApprovalRequests,
+                };
+
+                var continuations =
+                    parentSession.StateBag.TryGetValue<Dictionary<string, AgentFunctionContinuationState>>(
+                        AgentFunctionContinuationState.StateBagKey,
+                        out Dictionary<string, AgentFunctionContinuationState>? storedContinuation,
+                        AgentJsonUtilities.DefaultOptions) && storedContinuation is not null
+                        ? storedContinuation
+                        : new Dictionary<string, AgentFunctionContinuationState>();
+
+                continuations[continuation.Id] = continuation;
+
+                // Save approval requests of sub agent to state bag of parent agent
+                parentSession.StateBag.SetValue(AgentFunctionContinuationState.StateBagKey, continuations,
+                    AgentJsonUtilities.DefaultOptions);
+
+                parentInvocationContext.Terminate = true;
+
+                return new AgentAsFunctionResult { ContinuationId = continuation.Id };
+            }
+
             return response.Text;
         }
 
@@ -111,4 +176,22 @@ public static partial class AIAgentExtensions
     private static Regex InvalidNameCharsRegex() => s_invalidNameCharsRegex;
     private static readonly Regex s_invalidNameCharsRegex = new("[^0-9A-Za-z]+", RegexOptions.Compiled);
 #endif
+}
+
+internal sealed class AgentFunctionContinuationState
+{
+    /// <summary>
+    /// Init from GUID
+    /// </summary>
+    public string Id { get; init; } = string.Empty;
+
+    public string AgentAsFunctionName { get; init; } = string.Empty;
+
+    public FunctionCallContent ParentFunctionCall { get; init; } = null!;
+
+    public JsonElement SubAgentSerializedSession { get; init; }
+
+    public List<ToolApprovalRequestContent> PendingToolApprovalRequests { get; init; } = [];
+
+    internal const string StateBagKey = "__agentAsFunctionContinuations";
 }

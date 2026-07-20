@@ -4,6 +4,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using Microsoft.Agents.AI;
+using Microsoft.Agents.AI.ChatClient;
 using Microsoft.Extensions.AI;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -52,6 +53,8 @@ public static class ChatClientExtensions
     internal static IChatClient WithDefaultAgentMiddleware(this IChatClient chatClient, ChatClientAgentOptions? options, IServiceProvider? services = null)
     {
         var chatBuilder = chatClient.AsBuilder();
+
+        chatBuilder.Use(innerClient => new AgentAsFunctionApprovalForwardingChatClient(innerClient));
 
         // ApprovalNotRequiredFunctionBypassingChatClient is registered before FunctionInvokingChatClient so that
         // it sits above FICC in the pipeline. ChatClientBuilder.Build applies factories in reverse order,
