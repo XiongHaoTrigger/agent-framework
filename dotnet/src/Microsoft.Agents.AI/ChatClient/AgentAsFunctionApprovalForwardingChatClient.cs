@@ -14,15 +14,45 @@ internal class AgentAsFunctionApprovalForwardingChatClient(IChatClient innerClie
     public override async Task<ChatResponse> GetResponseAsync(IEnumerable<ChatMessage> messages, ChatOptions? options = null,
         CancellationToken cancellationToken = new CancellationToken())
     {
-        // 1. 检查输入中是否包含对子 Agent 审批的回复
-        // 2. 根据 RequestId 找到 continuation
-        // 3. 找到对应的子 Agent
-        // 4. 反序列化 SubAgentSerializedSession
-        // 5. 先恢复并运行子 Agent
-        // 6. 子 Agent 完成后，生成父调用对应的 FunctionResultContent
-        // 7. 再调用 base.GetResponseAsync，让父 Agent 继续
+        var chatMessages = messages as ChatMessage[] ?? messages.ToArray();
+        var toolApprovalResponses = chatMessages
+            .SelectMany(m => m.Contents)
+            .OfType<ToolApprovalResponseContent>()
+            .ToList();
 
-        var response = await base.GetResponseAsync(messages, options, cancellationToken).ConfigureAwait(false);
+        if (toolApprovalResponses.Count > 0)
+        {
+            // 检查输入中是否包含对子 Agent 审批的回复
+            Dictionary<string, AgentFunctionContinuationState>? continuations1 = null;
+            var isSucceed = AIAgent.CurrentRunContext?.Session?.StateBag.TryGetValue(
+                AgentFunctionContinuationState.StateBagKey, out continuations1, AgentJsonUtilities.DefaultOptions);
+
+            if (isSucceed == true && continuations1 is not null)
+            {
+                foreach (var toolApprovalResponse in toolApprovalResponses)
+                {
+                    // 在所有 continuation 的 PendingToolApprovalRequests 中找匹配的 RequestId
+                    var matchedContinuation = continuations1.Values
+                        .FirstOrDefault(c => c.PendingToolApprovalRequests
+                            .Any(r => r.RequestId == toolApprovalResponse.RequestId));
+
+                    if (matchedContinuation is not null)
+                    {
+                        var subSession = await matchedContinuation.SubAgent
+                            .DeserializeSessionAsync(matchedContinuation.SubAgentSerializedSession,
+                                cancellationToken: cancellationToken)
+                            .ConfigureAwait(false);
+
+                        var approvalMessage = new ChatMessage(ChatRole.User, [toolApprovalResponse]);
+                        var subResponse = matchedContinuation.SubAgent
+                            .RunAsync(subSession, cancellationToken: cancellationToken)
+                            .ConfigureAwait(false);
+                    }
+                }
+            }
+        }
+
+        var response = await base.GetResponseAsync(chatMessages, options, cancellationToken).ConfigureAwait(false);
 
         var parentSession = AIAgent.CurrentRunContext?.Session;
         if (parentSession is null)
@@ -96,7 +126,7 @@ internal class AgentAsFunctionApprovalForwardingChatClient(IChatClient innerClie
                 if (TryGetContinuationId(res[j].Result, out var continuationId) &&
                     continuationId == continuation.Id)
                 {
-                    // repleace
+                    // replace
                     messages.RemoveAt(i);
                     var chatMessage = new ChatMessage()
                     {

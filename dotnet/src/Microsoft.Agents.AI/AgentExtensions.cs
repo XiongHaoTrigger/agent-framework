@@ -68,19 +68,23 @@ public static partial class AIAgentExtensions
     /// as that could lead to undefined and unpredictable behavior.
     /// </para>
     /// </remarks>
-    public static AIFunction AsAIFunction(this AIAgent agent, AIFunctionFactoryOptions? options = null, AgentSession? session = null)
+    public static AIFunction AsAIFunction(this AIAgent agent, AIFunctionFactoryOptions? options = null,
+        AgentSession? session = null)
     {
         Throw.IfNull(agent);
 
         [Description("Invoke an agent to retrieve some information.")]
         async Task<object> InvokeAgentAsync(
-            [Description("Input query to invoke the agent.")] string query,
+            [Description("Input query to invoke the agent.")]
+            string query,
             CancellationToken cancellationToken)
         {
             // Propagate any additional properties from the parent agent's run to the child agent if the parent is using a FunctionInvokingChatClient.
-            AgentRunOptions? agentRunOptions = FunctionInvokingChatClient.CurrentContext?.Options?.AdditionalProperties is AdditionalPropertiesDictionary dict
-                ? new AgentRunOptions { AdditionalProperties = dict }
-                : null;
+            AgentRunOptions? agentRunOptions =
+                FunctionInvokingChatClient.CurrentContext?.Options?.AdditionalProperties is
+                    AdditionalPropertiesDictionary dict
+                    ? new AgentRunOptions { AdditionalProperties = dict }
+                    : null;
 
             // Save base agent data
             var parentSession = AIAgent.CurrentRunContext?.Session;
@@ -107,7 +111,7 @@ public static partial class AIAgentExtensions
                     throw new InvalidOperationException("A parent session is required to resume the child agent.");
                 }
 
-                if (parentInvocationContext?.CallContent is not { } parentFunctionCall)
+                if (parentInvocationContext?.CallContent is not { } parentFunctionCallContext)
                 {
                     throw new InvalidOperationException(
                         "The parent function call context is unavailable.");
@@ -118,13 +122,12 @@ public static partial class AIAgentExtensions
 
                 var continuation = new AgentFunctionContinuationState
                 {
-                    Id = Guid.NewGuid().ToString("N"),
-                    AgentAsFunctionName = parentFunctionCall.Name,
-                    ParentFunctionCall = parentFunctionCall,
+                    SubAgent = agent,
+                    AgentAsFunctionName = parentFunctionCallContext.Name,
+                    ParentFunctionCallContext = parentFunctionCallContext,
                     SubAgentSerializedSession = serializedSession,
                     PendingToolApprovalRequests = toolApprovalRequests,
                 };
-
                 var continuations =
                     parentSession.StateBag.TryGetValue<Dictionary<string, AgentFunctionContinuationState>>(
                         AgentFunctionContinuationState.StateBagKey,
@@ -174,24 +177,7 @@ public static partial class AIAgentExtensions
     private static partial Regex InvalidNameCharsRegex();
 #else
     private static Regex InvalidNameCharsRegex() => s_invalidNameCharsRegex;
+
     private static readonly Regex s_invalidNameCharsRegex = new("[^0-9A-Za-z]+", RegexOptions.Compiled);
 #endif
-}
-
-internal sealed class AgentFunctionContinuationState
-{
-    /// <summary>
-    /// Init from GUID
-    /// </summary>
-    public string Id { get; init; } = string.Empty;
-
-    public string AgentAsFunctionName { get; init; } = string.Empty;
-
-    public FunctionCallContent ParentFunctionCall { get; init; } = null!;
-
-    public JsonElement SubAgentSerializedSession { get; init; }
-
-    public List<ToolApprovalRequestContent> PendingToolApprovalRequests { get; init; } = [];
-
-    internal const string StateBagKey = "__agentAsFunctionContinuations";
 }
