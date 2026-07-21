@@ -17,7 +17,7 @@ internal sealed record AgentFunctionContinuationState
 
     public JsonElement SubAgentSerializedSession { get; init; }
 
-    public List<ToolApprovalRequestContent> PendingToolApprovalRequests { get; init; } = [];
+    public List<ToolApprovalRequestContent> PendingToolApprovalRequests { get; set; } = [];
 
     public string AgentAsFunctionName { get; init; } = string.Empty;
 

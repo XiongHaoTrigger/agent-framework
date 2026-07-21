@@ -20,6 +20,9 @@ internal class AgentAsFunctionApprovalForwardingChatClient(IChatClient innerClie
             .OfType<ToolApprovalResponseContent>()
             .ToList();
 
+        // 获取当前agent session
+        var parentAgentSession = AIAgent.CurrentRunContext?.Session;
+
         if (toolApprovalResponses.Count > 0)
         {
             // 检查输入中是否包含对子 Agent 审批的回复
@@ -44,23 +47,55 @@ internal class AgentAsFunctionApprovalForwardingChatClient(IChatClient innerClie
                             .ConfigureAwait(false);
 
                         var approvalMessage = new ChatMessage(ChatRole.User, [toolApprovalResponse]);
-                        var subResponse = matchedContinuation.SubAgent
-                            .RunAsync(subSession, cancellationToken: cancellationToken)
+
+                        // Run sub agent
+                        var subResponse = await matchedContinuation.SubAgent
+                            .RunAsync([approvalMessage], subSession, cancellationToken: cancellationToken)
                             .ConfigureAwait(false);
+
+                        // 查询最后是否存在未审批的请求
+                        for (int i = subResponse.Messages.Count - 1; i >= 0; i--)
+                        {
+                            if (subResponse.Messages[i].Role == ChatRole.User &&
+                                subResponse.Messages[i].Contents.Any(c => c is ToolApprovalResponseContent))
+                            {
+                                break;
+                            }
+
+                            if (subResponse.Messages[i].Role == ChatRole.Assistant &&
+                                subResponse.Messages[i].Contents.Any(c => c is ToolApprovalRequestContent))
+                            {
+                                var toolApprovalRequests = subResponse.Messages[i].Contents
+                                    .OfType<ToolApprovalRequestContent>()
+                                    .ToList();
+                                matchedContinuation.PendingToolApprovalRequests = toolApprovalRequests;
+
+                                // 更改父 agent 的 messages
+                                var message = new ChatMessage()
+                                {
+                                    Role = ChatRole.Assistant,
+                                    Contents = [..toolApprovalRequests]
+                                };
+                                return new ChatResponse(chatMessages.Append(message).ToList());
+                            }
+                        }
                     }
                 }
+
+                // 删除处理完成之后的SetBag的数据
+                parentAgentSession?.StateBag.TryRemoveValue(AgentFunctionContinuationState.StateBagKey);
             }
         }
 
         var response = await base.GetResponseAsync(chatMessages, options, cancellationToken).ConfigureAwait(false);
 
-        var parentSession = AIAgent.CurrentRunContext?.Session;
-        if (parentSession is null)
+        parentAgentSession = AIAgent.CurrentRunContext?.Session;
+        if (parentAgentSession is null)
         {
             return response;
         }
 
-        if (!parentSession.StateBag.TryGetValue<Dictionary<string, AgentFunctionContinuationState>>(
+        if (!parentAgentSession.StateBag.TryGetValue<Dictionary<string, AgentFunctionContinuationState>>(
                 AgentFunctionContinuationState.StateBagKey, out var continuations, AgentJsonUtilities.DefaultOptions) ||
             continuations is null)
         {
