@@ -1,5 +1,6 @@
-// Copyright (c) Microsoft. All rights reserved.
+﻿// Copyright (c) Microsoft. All rights reserved.
 
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text.Json;
@@ -22,72 +23,86 @@ internal class AgentAsFunctionApprovalForwardingChatClient(IChatClient innerClie
 
         // 获取当前agent session
         var parentAgentSession = AIAgent.CurrentRunContext?.Session;
+        var parentInvocationContext = FunctionInvokingChatClient.CurrentContext;;
 
+        // 存在审批响应
         if (toolApprovalResponses.Count > 0)
         {
             // 检查输入中是否包含对子 Agent 审批的回复
-            Dictionary<string, AgentFunctionContinuationState>? continuations1 = null;
-            var isSucceed = AIAgent.CurrentRunContext?.Session?.StateBag.TryGetValue(
-                AgentFunctionContinuationState.StateBagKey, out continuations1, AgentJsonUtilities.DefaultOptions);
+            Dictionary<string, AgentFunctionContinuationState>? continuations = null;
+            var isSucceed = AIAgent.CurrentRunContext?.Session?.StateBag
+                .TryGetValue<Dictionary<string, AgentFunctionContinuationState>>(
+                    AgentFunctionContinuationState.StateBagKey, out continuations,
+                    AgentJsonUtilities.DefaultOptions);
 
-            if (isSucceed == true && continuations1 is not null)
+            if (isSucceed == true && continuations is not null)
             {
-                foreach (var toolApprovalResponse in toolApprovalResponses)
+                // 分组，对于每个agent的多个审批请求，实现一次执行
+                // 此时 用户返回的 toolApprovalResponses 中可能有对多个agent的toolApprovalResponse，此处需要以agent为中心去查询每个agent的toolApprovalResponses，即以
+                foreach (var continuation in continuations)
                 {
-                    // 在所有 continuation 的 PendingToolApprovalRequests 中找匹配的 RequestId
-                    var matchedContinuation = continuations1.Values
-                        .FirstOrDefault(c => c.PendingToolApprovalRequests
-                            .Any(r => r.RequestId == toolApprovalResponse.RequestId));
-
-                    if (matchedContinuation is not null)
+                    // 找到这个agent对应的全部审批响应
+                    var matchedResponses = toolApprovalResponses
+                        .Where(response =>
+                            continuation.Value.PendingToolApprovalRequests.Any(request => request.RequestId == response.RequestId))
+                        .ToList();
+                    if (matchedResponses.Count == 0)
                     {
-                        var subSession = await matchedContinuation.SubAgent
-                            .DeserializeSessionAsync(matchedContinuation.SubAgentSerializedSession,
-                                cancellationToken: cancellationToken)
-                            .ConfigureAwait(false);
-
-                        var approvalMessage = new ChatMessage(ChatRole.User, [toolApprovalResponse]);
-
-                        // Run sub agent
-                        var subResponse = await matchedContinuation.SubAgent
-                            .RunAsync([approvalMessage], subSession, cancellationToken: cancellationToken)
-                            .ConfigureAwait(false);
-
-                        // 查询最后是否存在未审批的请求
-                        for (int i = subResponse.Messages.Count - 1; i >= 0; i--)
-                        {
-                            if (subResponse.Messages[i].Role == ChatRole.User &&
-                                subResponse.Messages[i].Contents.Any(c => c is ToolApprovalResponseContent))
-                            {
-                                break;
-                            }
-
-                            if (subResponse.Messages[i].Role == ChatRole.Assistant &&
-                                subResponse.Messages[i].Contents.Any(c => c is ToolApprovalRequestContent))
-                            {
-                                var toolApprovalRequests = subResponse.Messages[i].Contents
-                                    .OfType<ToolApprovalRequestContent>()
-                                    .ToList();
-                                matchedContinuation.PendingToolApprovalRequests = toolApprovalRequests;
-
-                                // 更改父 agent 的 messages
-                                var message = new ChatMessage()
-                                {
-                                    Role = ChatRole.Assistant,
-                                    Contents = [..toolApprovalRequests]
-                                };
-                                return new ChatResponse(chatMessages.Append(message).ToList());
-                            }
-                        }
+                        continue;
                     }
+
+                    // 恢复子agent的执行
+                    var subAgentToolApprovalResponsesChatMessage = new ChatMessage(ChatRole.User, [..matchedResponses]);
+                    var subAgentSession = await continuation.Value.SubAgent.DeserializeSessionAsync(
+                            continuation.Value.SubAgentSerializedSession,
+                            AgentJsonUtilities.DefaultOptions,
+                            cancellationToken)
+                        .ConfigureAwait(false);
+                    var subAgentResponse = await continuation.Value.SubAgent.RunAsync(
+                            subAgentToolApprovalResponsesChatMessage,
+                            subAgentSession,
+                            cancellationToken: cancellationToken)
+                        .ConfigureAwait(false);
+
+                    var nextToolApprovalRequests = subAgentResponse.Messages
+                        .SelectMany(m => m.Contents)
+                        .OfType<ToolApprovalRequestContent>().ToList();
+
+                    // 删除父agent中的子agent请求响应
+                    // 未实现
+                    if (nextToolApprovalRequests.Count > 0)
+                    {
+                        var serializedSession =
+                            await continuation.Value.SubAgent.SerializeSessionAsync(
+                                subAgentSession,
+                                cancellationToken: cancellationToken).ConfigureAwait(false);
+                        continuations[continuation.Key] = continuation.Value with
+                        {
+                            SubAgentSerializedSession = serializedSession,
+                            PendingToolApprovalRequests = nextToolApprovalRequests,
+                        };
+
+                        return new ChatResponse(new ChatMessage(ChatRole.Assistant, [..nextToolApprovalRequests]));
+                    }
+
+                    // 闭环 FRC
+                    var closeLoopFunctionResultContext = new FunctionResultContent(
+                        continuation.Value.ParentCallSubAgentCallId,
+                        subAgentResponse.Text);
+                    messages = messages.Append(new ChatMessage(ChatRole.Tool, [closeLoopFunctionResultContext]));
+
+                    // 清理对应agent的StateBag数据
+                    continuations.Remove(continuation.Key);
                 }
 
-                // 删除处理完成之后的SetBag的数据
-                parentAgentSession?.StateBag.TryRemoveValue(AgentFunctionContinuationState.StateBagKey);
+                if (continuations.Count == 0)
+                {
+                    parentAgentSession?.StateBag.TryRemoveValue(AgentFunctionContinuationState.StateBagKey);
+                }
             }
         }
 
-        var response = await base.GetResponseAsync(chatMessages, options, cancellationToken).ConfigureAwait(false);
+        var response = await base.GetResponseAsync(messages, options, cancellationToken).ConfigureAwait(false);
 
         parentAgentSession = AIAgent.CurrentRunContext?.Session;
         if (parentAgentSession is null)
@@ -95,16 +110,28 @@ internal class AgentAsFunctionApprovalForwardingChatClient(IChatClient innerClie
             return response;
         }
 
-        if (!parentAgentSession.StateBag.TryGetValue<Dictionary<string, AgentFunctionContinuationState>>(
-                AgentFunctionContinuationState.StateBagKey, out var continuations, AgentJsonUtilities.DefaultOptions) ||
-            continuations is null)
+        // 检查最后一个RFC
+        for (int i = response.Messages.Count - 1; i >= 0; i--)
         {
-            return response;
-        }
+            if (response.Messages[i].Role == ChatRole.Tool)
+            {
+                var frc = response.Messages[i].Contents.OfType<FunctionResultContent>().FirstOrDefault();
+                TryGetContinuationId(frc?.Result, out var continuationId);
 
-        foreach (AgentFunctionContinuationState agentFunctionContinuationState in continuations.Values)
-        {
-            ForwardApprovalRequests(response.Messages, agentFunctionContinuationState);
+                // 查询StateBag
+                parentAgentSession.StateBag.TryGetValue<Dictionary<string, AgentFunctionContinuationState>>(
+                    AgentFunctionContinuationState.StateBagKey,
+                    out var continuations,
+                    AgentJsonUtilities.DefaultOptions);
+
+                if (continuations is not null && continuations.TryGetValue(continuationId, out var continuation))
+                {
+                    // 替换FRC 为 ToolApprovalRequest
+                    var toolApprovalRequests = continuation.PendingToolApprovalRequests;
+                    response.Messages[i].Role = ChatRole.Assistant;
+                    response.Messages[i].Contents = [..toolApprovalRequests];
+                }
+            }
         }
 
         return response;
@@ -139,38 +166,33 @@ internal class AgentAsFunctionApprovalForwardingChatClient(IChatClient innerClie
         return false;
     }
 
-    /// <summary>
-    /// Replace sub agent FCC with approval requests
-    /// </summary>
-    /// <param name="messages">Chat Messages</param>
-    /// <param name="continuation">Saved sub agent state</param>
-    private static void ForwardApprovalRequests(IList<ChatMessage> messages, AgentFunctionContinuationState continuation)
-    {
-        for (int i = messages.Count - 1; i >= 0; i--)
-        {
-            var message = messages[i];
-            if (message.Role != ChatRole.Tool)
-            {
-                continue;
-            }
-
-            var res = message.Contents.OfType<FunctionResultContent>().ToList();
-
-            for (int j = res.Count - 1; j >= 0; j--)
-            {
-                if (TryGetContinuationId(res[j].Result, out var continuationId) &&
-                    continuationId == continuation.Id)
-                {
-                    // replace
-                    messages.RemoveAt(i);
-                    var chatMessage = new ChatMessage()
-                    {
-                        Role = ChatRole.Assistant,
-                        Contents = [..continuation.PendingToolApprovalRequests],
-                    };
-                    messages.Insert(i, chatMessage);
-                }
-            }
-        }
-    }
+    // private static void ForwardApprovalRequests(IList<ChatMessage> messages, AgentFunctionContinuationState continuation)
+    // {
+    //     for (int i = messages.Count - 1; i >= 0; i--)
+    //     {
+    //         var message = messages[i];
+    //         if (message.Role != ChatRole.Tool)
+    //         {
+    //             continue;
+    //         }
+    //
+    //         var res = message.Contents.OfType<FunctionResultContent>().ToList();
+    //
+    //         for (int j = res.Count - 1; j >= 0; j--)
+    //         {
+    //             if (TryGetContinuationId(res[j].Result, out var continuationId) &&
+    //                 continuationId == continuation.Id)
+    //             {
+    //                 // replace
+    //                 messages.RemoveAt(i);
+    //                 var chatMessage = new ChatMessage()
+    //                 {
+    //                     Role = ChatRole.Assistant,
+    //                     Contents = [..continuation.PendingToolApprovalRequests],
+    //                 };
+    //                 messages.Insert(i, chatMessage);
+    //             }
+    //         }
+    //     }
+    // }
 }

@@ -122,11 +122,12 @@ public static partial class AIAgentExtensions
 
                 var continuation = new AgentFunctionContinuationState
                 {
+                    ContinuationId = Guid.NewGuid().ToString("N"),
                     SubAgent = agent,
-                    AgentAsFunctionName = parentFunctionCallContext.Name,
-                    ParentFunctionCallContext = parentFunctionCallContext,
+                    ParentCallSubAgentCallName = parentFunctionCallContext.Name,
                     SubAgentSerializedSession = serializedSession,
                     PendingToolApprovalRequests = toolApprovalRequests,
+                    ParentCallSubAgentCallId = parentFunctionCallContext.CallId,
                 };
                 var continuations =
                     parentSession.StateBag.TryGetValue<Dictionary<string, AgentFunctionContinuationState>>(
@@ -136,7 +137,7 @@ public static partial class AIAgentExtensions
                         ? storedContinuation
                         : new Dictionary<string, AgentFunctionContinuationState>();
 
-                continuations[continuation.Id] = continuation;
+                continuations[continuation.ContinuationId] = continuation;
 
                 // Save approval requests of sub agent to state bag of parent agent
                 parentSession.StateBag.SetValue(AgentFunctionContinuationState.StateBagKey, continuations,
@@ -144,7 +145,7 @@ public static partial class AIAgentExtensions
 
                 parentInvocationContext.Terminate = true;
 
-                return new AgentAsFunctionResult { ContinuationId = continuation.Id };
+                return new AgentAsFunctionResult { ContinuationId = continuation.ContinuationId };
             }
 
             return response.Text;
