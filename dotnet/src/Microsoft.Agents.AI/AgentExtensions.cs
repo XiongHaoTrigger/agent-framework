@@ -1,7 +1,11 @@
 ﻿// Copyright (c) Microsoft. All rights reserved.
 
 using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.ComponentModel;
+using System.Linq;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
@@ -69,7 +73,7 @@ public static partial class AIAgentExtensions
         Throw.IfNull(agent);
 
         [Description("Invoke an agent to retrieve some information.")]
-        async Task<string> InvokeAgentAsync(
+        async Task<object> InvokeAgentAsync(
             [Description("Input query to invoke the agent.")] string query,
             CancellationToken cancellationToken)
         {
@@ -78,7 +82,58 @@ public static partial class AIAgentExtensions
                 ? new AgentRunOptions { AdditionalProperties = dict }
                 : null;
 
+            var parentFunctionCallContext = FunctionInvokingChatClient.CurrentContext;
+            var parentRunContext = AIAgent.CurrentRunContext;
+
+            session = session ?? await agent.CreateSessionAsync(cancellationToken).ConfigureAwait(false);
             var response = await agent.RunAsync(query, session: session, options: agentRunOptions, cancellationToken: cancellationToken).ConfigureAwait(false);
+
+            var toolApprovalRequests = response.Messages
+                .SelectMany(message => message.Contents)
+                .OfType<ToolApprovalRequestContent>()
+                .ToList();
+
+            // 检查是否存在审批请求
+            if (toolApprovalRequests.Count > 0)
+            {
+                // 只能使用执行子 Agent 前保存的父上下文。
+                var parentSession = parentRunContext?.Session ?? throw new InvalidOperationException("Agent-as-function approval requires a parent agent session.");
+                var parentCallContext = parentFunctionCallContext ?? throw new InvalidOperationException("Agent-as-function approval requires a parent function invocation context.");
+
+                var childRunContext = AIAgent.CurrentRunContext;
+
+                var serializedSession = await agent.SerializeSessionAsync(session, AgentJsonUtilities.DefaultOptions, cancellationToken).ConfigureAwait(false);
+
+                var toolApprovalRequestDict =
+                    toolApprovalRequests.ToDictionary(request => request.RequestId, request => request);
+
+                var agentAsFunctionContinuation = new AgentAsFunctionContinuation
+                {
+                    ParentCallName = parentCallContext.CallContent.Name,
+                    ParentCallId = parentCallContext.CallContent.CallId,
+                    SerializedSession = serializedSession,
+                    PendingToolApprovalRequestDict = new ConcurrentDictionary<string, ToolApprovalRequestContent>(toolApprovalRequestDict)
+                };
+
+                var continuationId = Guid.NewGuid().ToString("N");
+                var continuations =
+                    parentSession.StateBag.TryGetValue<Dictionary<string, AgentAsFunctionContinuation>>(
+                        AgentAsFunctionContinuation.StateBagKey,
+                        out var storedContinuations,
+                        AgentJsonUtilities.DefaultOptions)
+                        ? storedContinuations!
+                        : [];
+                continuations[continuationId] = agentAsFunctionContinuation;
+                // 保存到父agent StateBag
+                parentSession.StateBag.SetValue(AgentAsFunctionContinuation.StateBagKey,
+                    continuations, AgentJsonUtilities.DefaultOptions);
+
+                // 终止父agent的FICC循环
+                parentCallContext.Terminate = true;
+
+                return $"__agent_continuation__:{continuationId}";
+            }
+
             return response.Text;
         }
 
@@ -86,7 +141,8 @@ public static partial class AIAgentExtensions
         options.Name ??= SanitizeAgentName(agent.Name);
         options.Description ??= agent.Description;
 
-        return AIFunctionFactory.Create(InvokeAgentAsync, options);
+        var innerFunction = AIFunctionFactory.Create(InvokeAgentAsync, options);
+        return new AgentAIFunction(agent, innerFunction);
     }
 
     /// <summary>

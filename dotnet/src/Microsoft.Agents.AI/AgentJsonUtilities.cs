@@ -69,6 +69,7 @@ internal static partial class AgentJsonUtilities
     [JsonSerializable(typeof(ChatClientAgentSession))]
     [JsonSerializable(typeof(TextSearchProvider.TextSearchProviderState))]
     [JsonSerializable(typeof(ChatHistoryMemoryProvider.State))]
+    [JsonSerializable(typeof(Dictionary<string, AgentAsFunctionContinuation>), TypeInfoPropertyName = "AgentAsFunctionContinuationDictionary")]
 
     // TodoProvider types
     [JsonSerializable(typeof(TodoState))]

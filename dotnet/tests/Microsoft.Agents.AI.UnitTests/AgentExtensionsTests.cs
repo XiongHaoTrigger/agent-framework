@@ -44,6 +44,22 @@ public class AgentExtensionsTests
     }
 
     [Fact]
+    public void CreateFromAgent_WithValidAgent_ReturnsDiscoverableAgentAIFunction()
+    {
+        // Arrange
+        var mockAgent = new Mock<AIAgent>();
+        mockAgent.Setup(a => a.Name).Returns("TestAgent");
+
+        // Act
+        var result = mockAgent.Object.AsAIFunction();
+
+        // Assert
+        var agentFunction = result.GetService<AgentAIFunction>();
+        Assert.NotNull(agentFunction);
+        Assert.Same(mockAgent.Object, agentFunction.Agent);
+    }
+
+    [Fact]
     public void CreateFromAgent_WithAgentHavingNullName_UsesDefaultName()
     {
         // Arrange
