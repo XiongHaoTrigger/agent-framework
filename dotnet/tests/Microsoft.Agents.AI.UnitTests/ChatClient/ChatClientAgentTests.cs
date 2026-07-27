@@ -6,6 +6,7 @@ using System.Linq;
 using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.Agents.AI.ChatClient;
 using Microsoft.Extensions.AI;
 using Moq;
 using Moq.Protected;
@@ -41,7 +42,7 @@ public partial class ChatClientAgentTests
         Assert.Equal("test description", agent.Description);
         Assert.Equal("test instructions", agent.Instructions);
         Assert.NotNull(agent.ChatClient);
-        Assert.Equal("ApprovalResponseBindingChatClient", agent.ChatClient.GetType().Name);
+        Assert.IsType<AgentAsFunctionApprovalForwardingChatClient>(agent.ChatClient);
     }
 
     /// <summary>
@@ -1396,9 +1397,9 @@ public partial class ChatClientAgentTests
         Assert.NotNull(result);
         Assert.IsType<IChatClient>(result, exactMatch: false);
 
-        // Note: The result will be the outermost decorator (ApprovalResponseBindingChatClient,
+        // Note: The result will be the outermost decorator (AgentAsFunctionApprovalForwardingChatClient,
         // added by default), not the original mock.
-        Assert.Equal("ApprovalResponseBindingChatClient", result.GetType().Name);
+        Assert.IsType<AgentAsFunctionApprovalForwardingChatClient>(result);
     }
 
     /// <summary>

@@ -5,7 +5,6 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Linq;
-using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
@@ -85,8 +84,8 @@ public static partial class AIAgentExtensions
             var parentFunctionCallContext = FunctionInvokingChatClient.CurrentContext;
             var parentRunContext = AIAgent.CurrentRunContext;
 
-            session = session ?? await agent.CreateSessionAsync(cancellationToken).ConfigureAwait(false);
-            var response = await agent.RunAsync(query, session: session, options: agentRunOptions, cancellationToken: cancellationToken).ConfigureAwait(false);
+            var childSession = session ?? await agent.CreateSessionAsync(cancellationToken).ConfigureAwait(false);
+            var response = await agent.RunAsync(query, session: childSession, options: agentRunOptions, cancellationToken: cancellationToken).ConfigureAwait(false);
 
             var toolApprovalRequests = response.Messages
                 .SelectMany(message => message.Contents)
@@ -100,9 +99,7 @@ public static partial class AIAgentExtensions
                 var parentSession = parentRunContext?.Session ?? throw new InvalidOperationException("Agent-as-function approval requires a parent agent session.");
                 var parentCallContext = parentFunctionCallContext ?? throw new InvalidOperationException("Agent-as-function approval requires a parent function invocation context.");
 
-                var childRunContext = AIAgent.CurrentRunContext;
-
-                var serializedSession = await agent.SerializeSessionAsync(session, AgentJsonUtilities.DefaultOptions, cancellationToken).ConfigureAwait(false);
+                var serializedSession = await agent.SerializeSessionAsync(childSession, AgentJsonUtilities.DefaultOptions, cancellationToken).ConfigureAwait(false);
 
                 var toolApprovalRequestDict =
                     toolApprovalRequests.ToDictionary(request => request.RequestId, request => request);
@@ -112,7 +109,11 @@ public static partial class AIAgentExtensions
                     ParentCallName = parentCallContext.CallContent.Name,
                     ParentCallId = parentCallContext.CallContent.CallId,
                     SerializedSession = serializedSession,
-                    PendingToolApprovalRequestDict = new ConcurrentDictionary<string, ToolApprovalRequestContent>(toolApprovalRequestDict)
+                    PendingToolApprovalRequestDict = new ConcurrentDictionary<string, ToolApprovalRequestContent>(toolApprovalRequestDict),
+                    // 后续可能连续发生多次审批，因此从第一轮开始累计需要清理的审批请求 ID。
+                    SurfacedToolApprovalRequestIds = new HashSet<string>(
+                        toolApprovalRequests.Select(request => request.RequestId),
+                        StringComparer.Ordinal),
                 };
 
                 var continuationId = Guid.NewGuid().ToString("N");

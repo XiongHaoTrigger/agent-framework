@@ -152,6 +152,45 @@ public class AgentExtensionsTests
     }
 
     [Fact]
+    public async Task CreateFromAgent_WhenInvokedWithoutSession_CreatesDistinctSessionForEachInvocationAsync()
+    {
+        // Arrange
+        var expectedResponse = new AgentResponse(new ChatMessage(ChatRole.Assistant, "Test response"));
+        var testAgent = new TestAgent("TestAgent", "Test description", expectedResponse);
+        var aiFunction = testAgent.AsAIFunction();
+        var arguments = new AIFunctionArguments() { ["query"] = "Test query" };
+
+        // Act
+        await aiFunction.InvokeAsync(arguments);
+        await aiFunction.InvokeAsync(arguments);
+
+        // Assert
+        Assert.Equal(2, testAgent.ReceivedSessions.Count);
+        Assert.NotNull(testAgent.ReceivedSessions[0]);
+        Assert.NotNull(testAgent.ReceivedSessions[1]);
+        Assert.NotSame(testAgent.ReceivedSessions[0], testAgent.ReceivedSessions[1]);
+    }
+
+    [Fact]
+    public async Task CreateFromAgent_WhenInvokedWithSession_ReusesProvidedSessionAsync()
+    {
+        // Arrange
+        var expectedResponse = new AgentResponse(new ChatMessage(ChatRole.Assistant, "Test response"));
+        var testAgent = new TestAgent("TestAgent", "Test description", expectedResponse);
+        var session = new ChatClientAgentSession();
+        var aiFunction = testAgent.AsAIFunction(session: session);
+        var arguments = new AIFunctionArguments() { ["query"] = "Test query" };
+
+        // Act
+        await aiFunction.InvokeAsync(arguments);
+        await aiFunction.InvokeAsync(arguments);
+
+        // Assert
+        Assert.Equal(2, testAgent.ReceivedSessions.Count);
+        Assert.All(testAgent.ReceivedSessions, receivedSession => Assert.Same(session, receivedSession));
+    }
+
+    [Fact]
     public async Task CreateFromAgent_WhenFunctionInvokedWithCancellationTokenAsync_PassesCancellationTokenAsync()
     {
         // Arrange
@@ -399,7 +438,7 @@ public class AgentExtensionsTests
         }
 
         protected override ValueTask<AgentSession> CreateSessionCoreAsync(CancellationToken cancellationToken = default)
-            => throw new NotImplementedException();
+            => new(new ChatClientAgentSession());
 
         protected override ValueTask<JsonElement> SerializeSessionCoreAsync(AgentSession session, JsonSerializerOptions? jsonSerializerOptions = null, CancellationToken cancellationToken = default)
             => throw new NotImplementedException();
@@ -411,6 +450,7 @@ public class AgentExtensionsTests
         public override string? Description { get; }
 
         public List<ChatMessage> ReceivedMessages { get; } = [];
+        public List<AgentSession?> ReceivedSessions { get; } = [];
         public AgentRunOptions? ReceivedAgentRunOptions { get; private set; }
         public CancellationToken LastCancellationToken { get; private set; }
         public int RunAsyncCallCount { get; private set; }
@@ -424,6 +464,7 @@ public class AgentExtensionsTests
             this.RunAsyncCallCount++;
             this.LastCancellationToken = cancellationToken;
             this.ReceivedMessages.AddRange(messages);
+            this.ReceivedSessions.Add(session);
             this.ReceivedAgentRunOptions = options;
 
             if (this._exceptionToThrow is not null)
