@@ -14,9 +14,8 @@ internal sealed class TestAIAgent : AIAgent
     public Func<string>? NameFunc;
     public Func<string>? DescriptionFunc;
 
-    public Func<AgentSession, JsonSerializerOptions?, JsonElement> SerializeSessionFunc = delegate { throw new NotSupportedException(); };
-    public Func<JsonElement, JsonSerializerOptions?, AgentSession> DeserializeSessionFunc = delegate { throw new NotSupportedException(); };
-    public Func<AgentSession> CreateSessionFunc = delegate { throw new NotSupportedException(); };
+    public readonly Func<JsonElement, JsonSerializerOptions?, AgentSession> DeserializeSessionFunc = delegate { throw new NotSupportedException(); };
+    public readonly Func<AgentSession> CreateSessionFunc = delegate { throw new NotSupportedException(); };
     public Func<IEnumerable<ChatMessage>, AgentSession?, AgentRunOptions?, CancellationToken, Task<AgentResponse>> RunAsyncFunc = delegate { throw new NotSupportedException(); };
     public Func<IEnumerable<ChatMessage>, AgentSession?, AgentRunOptions?, CancellationToken, IAsyncEnumerable<AgentResponseUpdate>> RunStreamingAsyncFunc = delegate { throw new NotSupportedException(); };
     public Func<Type, object?, object?>? GetServiceFunc;
@@ -26,7 +25,7 @@ internal sealed class TestAIAgent : AIAgent
     public override string? Description => this.DescriptionFunc?.Invoke() ?? base.Description;
 
     protected override ValueTask<JsonElement> SerializeSessionCoreAsync(AgentSession session, JsonSerializerOptions? jsonSerializerOptions = null, CancellationToken cancellationToken = default)
-        => new(this.SerializeSessionFunc(session, jsonSerializerOptions));
+        => throw new NotImplementedException();
 
     protected override ValueTask<AgentSession> DeserializeSessionCoreAsync(JsonElement serializedState, JsonSerializerOptions? jsonSerializerOptions = null, CancellationToken cancellationToken = default) =>
         new(this.DeserializeSessionFunc(serializedState, jsonSerializerOptions));

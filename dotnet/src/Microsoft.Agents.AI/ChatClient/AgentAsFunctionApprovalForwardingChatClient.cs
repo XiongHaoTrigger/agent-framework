@@ -4,6 +4,8 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.CompilerServices;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.AI;
@@ -28,10 +30,10 @@ internal sealed class AgentAsFunctionApprovalForwardingChatClient : DelegatingCh
         {
             var resumeResult = await this.TryResumeChildAgentAsync(messageList, options, parentSession, cancellationToken)
                 .ConfigureAwait(false);
-            if (resumeResult?.ApprovalResponse is not null)
+            if (resumeResult?.ApprovalRequest is not null)
             {
                 // 子 Agent 再次请求审批，不能继续父 Agent。
-                return resumeResult.ApprovalResponse;
+                return resumeResult.ApprovalRequest;
             }
 
             if (resumeResult?.ParentMessages is not null)
@@ -79,18 +81,76 @@ internal sealed class AgentAsFunctionApprovalForwardingChatClient : DelegatingCh
         return response;
     }
 
-    private static bool TryGetContinuationId(
-        AIContent content,
-        out string continuationId)
+    public override async IAsyncEnumerable<ChatResponseUpdate> GetStreamingResponseAsync(IEnumerable<ChatMessage> messages, ChatOptions? options = null,
+        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+    {
+        // 必须在开始调用内部客户端前保存父 Session。
+        var parentSession = AIAgent.CurrentRunContext?.Session;
+        var messageList = messages.ToList();
+
+        if (parentSession is not null)
+        {
+            // streaming 和非 streaming 共用同一套子 Agent 恢复逻辑。
+            var resumeResult = await this.TryResumeChildAgentAsync(messageList, options, parentSession, cancellationToken).ConfigureAwait(false);
+
+            if (resumeResult?.ApprovalRequest is not null)
+            {
+                // 子 Agent 再次请求审批，直接把审批响应转换成 streaming update。
+                foreach (var update in new AgentResponse(resumeResult.ApprovalRequest).ToAgentResponseUpdates())
+                {
+                    yield return update.AsChatResponseUpdate();
+                }
+
+                yield break;
+            }
+
+            if (resumeResult?.ParentMessages is not null)
+            {
+                // 子 Agent 已完成，把 FunctionResultContent 交给父 Agent 继续运行。
+                messageList = resumeResult.ParentMessages;
+            }
+        }
+
+        await foreach (var update in base.GetStreamingResponseAsync(messageList, options, cancellationToken).ConfigureAwait(false))
+        {
+            if (parentSession is not null && TryReplaceContinuationMarkers(update.Contents, parentSession) is { } rewrittenContents)
+            {
+                update.Contents = rewrittenContents;
+            }
+
+            yield return update;
+        }
+    }
+
+    /// <summary>
+    /// 检查当前的content是否是marker，并且获取对应的continuationId即parent agent 对 sub agent 发起调用的function call id
+    /// </summary>
+    /// <param name="content">AIContent</param>
+    /// <param name="continuationId">parent agent 对 sub agent 发起调用的function call id</param>
+    /// <returns>是否获取成功</returns>
+    private static bool TryGetContinuationId(AIContent content, out string continuationId)
     {
         continuationId = string.Empty;
 
-        if (content is not FunctionResultContent { Result: string result } ||
-            !result.StartsWith(ContinuationPrefix, StringComparison.Ordinal))
+        if (content is not FunctionResultContent { Result: { } rawResult })
         {
             return false;
         }
 
+        var result = rawResult switch
+        {
+            string text => text,
+            JsonElement { ValueKind: JsonValueKind.String } json =>
+                json.GetString(),
+            _ => null,
+        };
+
+        if (result?.StartsWith(
+                ContinuationPrefix,
+                StringComparison.Ordinal) is not true)
+        {
+            return false;
+        }
         continuationId = result[ContinuationPrefix.Length..];
         return continuationId.Length > 0;
     }
@@ -107,26 +167,53 @@ internal sealed class AgentAsFunctionApprovalForwardingChatClient : DelegatingCh
             return null;
         }
 
-        // 消息历史里可能同时存在旧审批响应和父 Agent 自己的审批响应。
-        // 这里只选择 RequestId 与当前 pending 请求匹配的那一个。
-        var approvalResponse = messages
+        // 收集调用者提交的所有审批响应。
+        var approvalResponses = messages
             .SelectMany(message => message.Contents)
             .OfType<ToolApprovalResponseContent>()
-            .FirstOrDefault(response =>
-                continuations.Values.Any(continuation =>
-                    continuation.PendingToolApprovalRequestDict.ContainsKey(response.RequestId)));
+            .ToList();
 
-        if (approvalResponse is null)
+        if (approvalResponses.Count == 0)
         {
             return null;
         }
 
-        var continuationEntry = continuations.First(pair =>
-            pair.Value.PendingToolApprovalRequestDict.ContainsKey(approvalResponse.RequestId));
+        var continuationEntry = continuations.FirstOrDefault(pair =>
+            approvalResponses.Any(response =>
+                pair.Value.PendingToolApprovalRequestDict.ContainsKey(response.RequestId)));
+
+        if (continuationEntry.Value is null)
+        {
+            return null;
+        }
+
         var continuationId = continuationEntry.Key;
         var continuation = continuationEntry.Value;
-        var originalRequest =
-            continuation.PendingToolApprovalRequestDict[approvalResponse.RequestId];
+
+        // 同一个子 Agent 可能在一轮中同时产生多个审批请求。
+        // 收集属于当前 continuation 的全部审批响应，并忽略重复的 RequestId。
+        var reboundApprovals = new List<ToolApprovalResponseContent>();
+        var processedRequestIds = new HashSet<string>(StringComparer.Ordinal);
+
+        foreach (var approvalResponse in approvalResponses)
+        {
+            if (!processedRequestIds.Add(approvalResponse.RequestId) ||
+                !continuation.PendingToolApprovalRequestDict.TryGetValue(
+                    approvalResponse.RequestId,
+                    out var originalRequest))
+            {
+                continue;
+            }
+
+            // 使用原始审批请求中的 ToolCall，不能信任用户传入的 ToolCall。
+            reboundApprovals.Add(new ToolApprovalResponseContent(
+                approvalResponse.RequestId,
+                approvalResponse.Approved,
+                originalRequest.ToolCall)
+            {
+                Reason = approvalResponse.Reason,
+            });
+        }
 
         // StateBag 必须可序列化，不能直接保存 Agent 引用。
         // 因此使用父函数调用名，从本次可用工具中找回原来的 AgentAIFunction。
@@ -150,17 +237,8 @@ internal sealed class AgentAsFunctionApprovalForwardingChatClient : DelegatingCh
             AgentJsonUtilities.DefaultOptions,
             cancellationToken).ConfigureAwait(false);
 
-        // 使用原始审批请求中的 ToolCall，不能信任用户传入的 ToolCall。
-        var reboundApproval = new ToolApprovalResponseContent(
-            approvalResponse.RequestId,
-            approvalResponse.Approved,
-            originalRequest.ToolCall)
-        {
-            Reason = approvalResponse.Reason,
-        };
-
-        // 把审批结果作为用户消息传回子 Agent，使它从暂停位置继续执行。
-        var childResponse = await RunChildAgentAsync(agentFunction.Agent, childSession, reboundApproval, cancellationToken)
+        // 把本轮全部审批结果作为一条用户消息传回子 Agent，使它从暂停位置继续执行。
+        var childResponse = await RunChildAgentAsync(agentFunction.Agent, childSession, reboundApprovals, cancellationToken)
             .ConfigureAwait(false);
 
         var newApprovalRequests = childResponse.Messages
@@ -187,10 +265,7 @@ internal sealed class AgentAsFunctionApprovalForwardingChatClient : DelegatingCh
                 SurfacedToolApprovalRequestIds = surfacedRequestIds,
             };
 
-            parentSession.StateBag.SetValue(
-                AgentAsFunctionContinuation.StateBagKey,
-                continuations,
-                AgentJsonUtilities.DefaultOptions);
+            parentSession.StateBag.SetValue(AgentAsFunctionContinuation.StateBagKey, continuations, AgentJsonUtilities.DefaultOptions);
 
             var approvalMessages = childResponse.Messages
                 .Select(message =>
@@ -206,7 +281,7 @@ internal sealed class AgentAsFunctionApprovalForwardingChatClient : DelegatingCh
                 .Where(message => message.Contents.Count > 0)
                 .ToList();
 
-            return new ChildResumeResult(ApprovalResponse: new ChatResponse(approvalMessages));
+            return new ChildResumeResult(ApprovalRequest: new ChatResponse(approvalMessages));
         }
 
         // 子 Agent 已完成，不再需要保存 continuation。
@@ -262,20 +337,51 @@ internal sealed class AgentAsFunctionApprovalForwardingChatClient : DelegatingCh
         return new ChildResumeResult(ParentMessages: rewrittenMessages);
     }
 
-    private static async Task<AgentResponse> RunChildAgentAsync(
-        AIAgent agent,
-        AgentSession session,
-        ToolApprovalResponseContent approvalResponse,
-        CancellationToken cancellationToken)
+    private static async Task<AgentResponse> RunChildAgentAsync(AIAgent agent, AgentSession session,
+        IReadOnlyList<ToolApprovalResponseContent> approvalResponses, CancellationToken cancellationToken)
     {
-        return await agent.RunAsync(
-                [new ChatMessage(ChatRole.User, [approvalResponse])],
-                session,
-                cancellationToken: cancellationToken)
+        var approvalContents = approvalResponses
+            .Cast<AIContent>()
+            .ToList();
+
+        return await agent.RunAsync([new ChatMessage(ChatRole.User, approvalContents)], session, cancellationToken: cancellationToken)
             .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// 对单条ChatMessage处理，查询content中的marker中的call id并且将其替换为sub agent待审批的请求
+    /// </summary>
+    /// <param name="contents">单条ChatMessage中的contents</param>
+    /// <param name="parentSession">parent agent session</param>
+    /// <returns>全新构造的ChatMessage的Contents</returns>
+    private static List<AIContent>? TryReplaceContinuationMarkers(IList<AIContent> contents, AgentSession parentSession)
+    {
+        List<AIContent>? rewrittenContents = null;
+        for (int i = 0; i < contents.Count; i++)
+        {
+            var content = contents[i];
+            // 检查当前 content 是否为marker
+            if (TryGetContinuationId(content, out var continuationId))
+            {
+                parentSession.StateBag.TryGetValue<Dictionary<string, AgentAsFunctionContinuation>>(
+                    AgentAsFunctionContinuation.StateBagKey,
+                    out var continuations,
+                    AgentJsonUtilities.DefaultOptions);
+
+                // 获取 call id 对应的 sub agent 数据
+                if (continuations is not null && continuations.TryGetValue(continuationId, out var continuation))
+                {
+                    rewrittenContents ??= [.. contents.Take(i)];
+                    rewrittenContents.AddRange(continuation.PendingToolApprovalRequestDict.Values);
+                    continue;
+                }
+            }
+            rewrittenContents?.Add(content);
+        }
+        return rewrittenContents;
     }
 
     private sealed record ChildResumeResult(
         List<ChatMessage>? ParentMessages = null,
-        ChatResponse? ApprovalResponse = null);
+        ChatResponse? ApprovalRequest = null);
 }
